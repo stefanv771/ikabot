@@ -18,8 +18,24 @@ update_msg = ""
 isWindows = os.name == "nt"
 
 # Multiprocessing configuration for pure-Python local decaptcha
-# Set to False if your environment struggles with Python multiprocessing
+# Set to False if your environment struggles with Python multiprocessing.
+# Leaving this on is safe even with many accounts: the solver sizes itself to
+# the free cores and free RAM it finds at solve time, and falls back to a
+# single-process solve when the machine is busy.
 USE_MULTIPROCESSING_DECAPTCHA = True
+
+# Set to True to record how long each local captcha solve took, in the ikabot
+# log file (see LOGS_DIRECTORY_FILE below). One line per solve, tagged
+# [decaptcha-timing], with the worker count, the free RAM and the CPU
+# topology it decided from.
+# Off by default. Turn it on to compare performance across machines, or to
+# report a slow solve.
+DECAPTCHA_TIMING_LOG = False
+
+# Solve the pirates captcha locally instead of sending the image to the remote
+# decaptcha API. Set it to False to always use the remote API (via
+# getPiratesCaptchaSolution) for the pirates captcha.
+PIRATE_DECAPTCHA_LOCAL = True
 
 # Regional Settings
 # These environment variables can be set to match the user's browser region and
