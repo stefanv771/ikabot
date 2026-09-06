@@ -1,6 +1,7 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import random
 import threading
 import time
 import traceback
@@ -11,6 +12,32 @@ from ikabot.helpers.gui import enter
 from ikabot.helpers.process import set_child_mode
 from ikabot.helpers.signals import setInfoSignal
 from ikabot.helpers.varios import daysHoursMinutes
+
+
+def _jittered_interval_seconds(base_minutes, min_ratio=0.8, max_ratio=1.2):
+    """
+    Parameters
+    ----------
+    base_minutes : int
+        the interval the user configured, used as the average
+    min_ratio : float
+    max_ratio : float
+
+    Returns
+    -------
+    seconds : int
+        a randomized interval (in seconds), gaussian-distributed around
+        base_minutes, clipped to [base*min_ratio, base*max_ratio] so it
+        never drifts more than ~20% from what the user chose, and never
+        below 3 minutes (matching the minimum enforced at setup).
+    """
+    base_seconds = base_minutes * 60
+    std_dev = base_seconds * 0.08  # keeps most draws well inside +-20%
+    jittered = random.gauss(base_seconds, std_dev)
+    lower = base_seconds * min_ratio
+    upper = base_seconds * max_ratio
+    jittered = max(lower, min(upper, jittered))
+    return max(180, int(jittered))
 
 
 def alertAttacks(session, event, stdin_fd, predetermined_input):
@@ -65,13 +92,10 @@ def respondToAttack(session):
     session : ikabot.web.session.Session
     """
 
-    # this allows the user to respond to an attack via telegram
     while True:
         start_time = time.time()
         responses = getUserResponse(session)
         for response in responses:
-            # the response should be in the form of:
-            # <pid>:<action number>
             rta = re.search(r"(\d+):?\s*(\d+)", response)
             if rta is None:
                 continue
@@ -79,13 +103,10 @@ def respondToAttack(session):
             pid = int(rta.group(1))
             action = int(rta.group(2))
 
-            # if the pid doesn't match, we ignore it
             if pid != os.getpid():
                 continue
 
-            # currently just one action is supported
             if action == 1:
-                # mv
                 activateVacationMode(session)
             else:
                 sendToBot(session, "Invalid command: {:d}".format(action))
@@ -102,17 +123,14 @@ def do_it(session, minutes):
     minutes : int
     """
 
-    # this thread lets the user react to an attack once the alert is sent
     thread = threading.Thread(target=respondToAttack, args=(session,))
     thread.start()
 
     knownAttacks = []
     while True:
         start_time = time.time()
-        ##Catch errors inside the function to not exit for any reason.
         currentAttacks = []
         try:
-            # get the militaryMovements
             html = session.get()
             city_id = re.search(r"currentCityId:\s(\d+),", html).group(1)
             url = "view=militaryAdvisor&oldView=city&oldBackgroundView=city&backgroundView=city&currentCityId={}&actionRequest={}&ajax=1".format(
@@ -130,11 +148,9 @@ def do_it(session, minutes):
             ]:
                 event_id = militaryMovement["event"]["id"]
                 currentAttacks.append(event_id)
-                # if we already alerted this, do nothing
                 if event_id not in knownAttacks:
                     knownAttacks.append(event_id)
 
-                    # get information about the attack
                     missionText = militaryMovement["event"]["missionText"]
                     origin = militaryMovement["origin"]
                     target = militaryMovement["target"]
@@ -142,7 +158,6 @@ def do_it(session, minutes):
                     amountFleets = militaryMovement["fleet"]["amount"]
                     timeLeft = int(militaryMovement["eventTime"]) - timeNow
 
-                    # send alert
                     msg = "-- ALERT --\n"
                     msg += missionText + "\n"
                     msg += "from the city {} of {}\n".format(
@@ -161,10 +176,14 @@ def do_it(session, minutes):
             msg = "Error in:\n{}\nCause:\n{}".format(info, traceback.format_exc())
             sendToBot(session, msg)
 
-        # remove old attacks from knownAttacks
         for event_id in list(knownAttacks):
             if event_id not in currentAttacks:
                 knownAttacks.remove(event_id)
 
         elapsed = time.time() - start_time
-        time.sleep(max(0, minutes * 60 - elapsed))
+        next_check_seconds = max(0, _jittered_interval_seconds(minutes) - elapsed)
+        next_check_time = time.strftime(
+            "%Y-%m-%d %H:%M:%S", time.localtime(time.time() + next_check_seconds)
+        )
+        session.setStatus(f"Next attack check at {next_check_time}")
+        time.sleep(next_check_seconds)
