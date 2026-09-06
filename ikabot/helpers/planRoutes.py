@@ -32,14 +32,12 @@ def sendGoods(session, originCityId, destinationCityId, islandId, ships, send, u
     send : list
         array of resources to send
     """
-    # this can fail if a random request is made in between this two posts
     while True:
         html = session.get()
-        current_city = getCity(html)  # the city the bot is right now
-        city = getCity(session.get(city_url + originCityId))  # the origin city
+        current_city = getCity(html)
+        city = getCity(session.get(city_url + originCityId))
         currId = current_city["id"]
 
-        # Change from the city the bot is sitting right now to the city we want to load resources from
         data = {
             "action": "header",
             "function": "changeCurrentCity",
@@ -53,7 +51,6 @@ def sendGoods(session, originCityId, destinationCityId, islandId, ships, send, u
 
         session.post(params=data)
 
-        # Request to send the resources from the origin to the target
         data = {
             "action": "transportOperations",
             "function": "loadTransportersWithFreight",
@@ -85,7 +82,6 @@ def sendGoods(session, originCityId, destinationCityId, islandId, ships, send, u
             shiptype = "usedFreightersShips"
             data[shiptype] = ships
             data["transporters"] = "0"
-        # add amounts of resources to send
         for i in range(len(send)):
             if city["availableResources"][i] > 0:
                 key = "cargo_resource" if i == 0 else "cargo_tradegood{:d}".format(i)
@@ -154,8 +150,8 @@ def executeRoutes(session, routes, useFreighters=False):
             resources_to_send = sum(send)
             if resources_to_send == 0:
                 # no space available
-                # wait an hour and try again
-                wait(60 * 60)
+                # wait ~1h (randomized 45-75 min) and try again
+                wait(random.randint(45 * 60, 75 * 60))
                 continue
 
             if useFreighters is False:
