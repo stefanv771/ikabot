@@ -10,12 +10,9 @@ import getpass
 from collections import deque
 from typing import Optional, Dict, Any
 
-import requests
-from urllib3.exceptions import InsecureRequestWarning
-
 from ikabot import config
 from ikabot.config import *
-from ikabot.helpers.logging import getLogger
+from ikabot.helpers.logging import getLogger, setLoggedInPlayer
 from ikabot.helpers.aesCipher import AESCipher
 from ikabot.helpers.botComm import *
 from ikabot.helpers.gui import banner
@@ -36,22 +33,21 @@ except ImportError:
         def wait_if_globally_paused(username=None):
             pass
 
-# Disable SSL verification warnings if configured
-requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
-
 
 def normal_get(url, params=None):
     """Sends a standard get request to the provided url (required by constructionList etc.)."""
     try:
+        from curl_cffi import requests as c_requests
+        return c_requests.get(url, params=params or {}, impersonate="chrome120")
+    except Exception:
+        import requests
         return requests.get(url, params=params or {})
-    except requests.exceptions.ConnectionError:
-        sys.exit("Internet connection failed")
 
 
 class Session:
     """
     Modernized Session coordinator bridging Ikabot's feature modules
-    with LobbyClient and WorldClient.
+    with LobbyClient and WorldClient using Chrome TLS impersonation.
     """
 
     def __init__(self):
@@ -71,6 +67,12 @@ class Session:
             self.accept_language = config.build_accept_language(self.locale, self.gf_lang)
         else:
             self.accept_language = f"{self.gf_lang}-{self.gf_lang.upper()},{self.gf_lang};q=0.9,en;q=0.8"
+
+        # Game session identifier attributes (required by botComm.py and feature modules)
+        self.username = ""
+        self.servidor = ""
+        self.mundo = ""
+        self.word = ""
 
         self.lobby_client: Optional[LobbyClient] = None
         self.world_client: Optional[WorldClient] = None
@@ -100,6 +102,26 @@ class Session:
             print(f"[!] Warning: Blackbox generation error: {e}")
             self.logger.warning(f"Failed to generate blackbox token: {e}")
             return None
+
+    def _set_cookie_compatible(self, name: str, value: str, domain: str):
+        """Sets a cookie compatible with both curl_cffi and standard requests."""
+        if hasattr(self.s.cookies, "set"):
+            self.s.cookies.set(name, value, domain=domain)
+        elif hasattr(self.s.cookies, "set_cookie"):
+            import requests
+            cookie_obj = requests.cookies.create_cookie(domain=domain, name=name, value=value)
+            self.s.cookies.set_cookie(cookie_obj)
+        else:
+            self.s.cookies[name] = value
+
+    def _dump_cookies(self) -> dict:
+        """Dumps cookies to dictionary compatible with both curl_cffi and requests."""
+        if hasattr(self.s.cookies, "get_dict"):
+            return self.s.cookies.get_dict()
+        try:
+            return dict(self.s.cookies.items())
+        except Exception:
+            return dict(self.s.cookies)
 
     def __login(self, retries=0):
         if not self.logged:
@@ -150,11 +172,21 @@ class Session:
             num = read(min=1, max=len(active_accounts))
             self.account = active_accounts[num - 1]
 
-        # Bind world coordinates to session
+        # Bind world coordinates and world name to session
         self.username = self.account["name"]
         self.login_servidor = self.account["server"]["language"]
         self.mundo = str(self.account["server"]["number"])
         self.servidor = self.login_servidor
+
+        # Tag log records with player name (PR #426)
+        try:
+            setLoggedInPlayer(self.username)
+        except Exception:
+            pass
+
+        # Extract human-readable world name for Telegram formatting
+        srv_match = [s for s in servers if s.get("accountGroup") == self.account.get("accountGroup")]
+        self.word = srv_match[0]["name"] if srv_match else f"World {self.mundo}"
         
         # Initialize Server-Scoped Action Lock for this specific game world
         self.action_lock = GlobalActionLock(
@@ -163,7 +195,7 @@ class Session:
             min_delay_seconds=15
         )
 
-        # 3. Initialize World Client
+        # 3. Initialize World Client (impersonating Chrome 120 TLS)
         self.world_client = WorldClient(serv_number=int(self.mundo), serv_lang=self.servidor)
         self.host = self.world_client.host
         self.urlBase = self.world_client.url_base
@@ -178,12 +210,7 @@ class Session:
         if "ikariam" in cached_cookies:
             print(f"[*] Testing cached world session for {self.username} on s{self.mundo}-{self.servidor}...")
             for name, val in cached_cookies.items():
-                cookie_obj = requests.cookies.create_cookie(
-                    domain=self.host,
-                    name=name,
-                    value=val
-                )
-                self.s.cookies.set_cookie(cookie_obj)
+                self._set_cookie_compatible(name=name, value=val, domain=self.host)
 
             try:
                 test_html = self.world_client.get_city_view()
@@ -219,12 +246,12 @@ class Session:
                 manual_cookie = read(msg="Enter 'ikariam' cookie manually: ").strip()
                 self.world_client.set_session_cookie(manual_cookie)
 
-            # Persist the freshly acquired cookies partitioned by account ID
-            accountSessionData[account_storage_key] = dict(self.s.cookies.items())
+            # Persist freshly acquired cookies partitioned by account ID
+            accountSessionData[account_storage_key] = self._dump_cookies()
             self.setSessionData(accountSessionData)
             print(f"[+] Saved fresh session cookies for {self.username}.")
 
-        config.infoUser = f"Server:{self.servidor}, World:{self.mundo}, Player:{self.username}"
+        config.infoUser = f"Server:{self.servidor}, World:{self.word}, Player:{self.username}"
         banner()
         self.logged = True
 
@@ -239,7 +266,7 @@ class Session:
         base_url = self.urlBase.replace("index.php", "") if noIndex else self.urlBase
         full_url = (base_url + url).replace("?", "") if noQuery else (base_url + url)
 
-        response = self.s.get(full_url, params=params or {}, verify=config.do_ssl_verify, timeout=300, **kwargs)
+        response = self.s.get(full_url, params=params or {}, timeout=300, **kwargs)
         
         if not ignoreExpire and self.world_client.is_expired(response.text):
             self.logger.warning("Session expired detected in GET request. Re-logging...")
@@ -272,7 +299,8 @@ class Session:
         base_url = self.urlBase.replace("index.php", "") if noIndex else self.urlBase
         full_url = (base_url + url).replace("?", "") if noQuery else (base_url + url)
 
-        response = self.s.post(full_url, data=payloadPost, params=params, verify=config.do_ssl_verify, timeout=300, **kwargs)
+        # Support payloadPost as form-encoded data
+        response = self.s.post(full_url, data=payloadPost, params=params, timeout=300, **kwargs)
 
         if not ignoreExpire and self.world_client.is_expired(response.text):
             self.logger.warning("Session expired detected in POST request. Re-logging...")

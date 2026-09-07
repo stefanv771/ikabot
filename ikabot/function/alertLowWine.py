@@ -1,6 +1,8 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import os
+import sys
 import re
 import time
 import datetime
@@ -20,6 +22,7 @@ from ikabot.helpers.varios import daysHoursMinutes
 from ikabot.helpers.planRoutes import *
 
 getcontext().prec = 30
+
 
 def alertLowWine(session, event, stdin_fd, predetermined_input):
     """
@@ -66,21 +69,15 @@ def alertLowWine(session, event, stdin_fd, predetermined_input):
     try:
         do_it(session, hours, auto_transfer, transfer_amount)
     except Exception as e:
-        msg = (f"Error in:\n{info}\nCause:\n{traceback.format_exc()}")
+        msg = f"Error in:\n{info}\nCause:\n{traceback.format_exc()}"
         sendToBot(session, msg)
     finally:
         session.logout()
 
+
 def getMovementsFromHtml(session):
     """
-    Extract fleet movements using the same approach as See movements.
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    Returns
-    -------
-    list
-        A list of movements.
+    Extract fleet movements using the militaryAdvisor.
     """
     html = session.get()
     cityId = re.search(r"currentCityId:\s*(\d+),", html).group(1)
@@ -92,29 +89,21 @@ def getMovementsFromHtml(session):
     movements = resp[1][1][2]["viewScriptParams"]["militaryAndFleetMovements"]
     return movements
 
+
 def isWineTransportInProgress(session, destinationCityId):
     """
     Check if there is an ongoing wine transport to the specified city.
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    destinationCityId : str
-    Returns
-    -------
-    bool
     """
     movements = getMovementsFromHtml(session)
     for movement in movements:
         target = movement.get("target", {})
         resources = movement.get("resources", [])
 
-        # Convert both IDs to the same type for comparison
         target_city_id = str(target.get("cityId"))
         destination_city_id_str = str(destinationCityId)
 
-        # Check if the target city matches and the transport includes wine
         if target_city_id == destination_city_id_str:
-            wine_resource = next((res for res in resources if res["cssClass"] == "resource_icon wine"), None)
+            wine_resource = next((res for res in resources if res.get("cssClass") == "resource_icon wine"), None)
             if wine_resource:
                 origin = movement.get("origin", {}).get("name", "Unknown")
                 amount = wine_resource.get("amount", "Unknown")
@@ -123,128 +112,149 @@ def isWineTransportInProgress(session, destinationCityId):
 
     return None
 
+
 def do_it(session, hours, auto_transfer, transfer_amount):
     """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    hours : int
-    auto_transfer : bool
-    transfer_amount : int
+    Main background loop with dynamic next-event sleep scheduling.
     """
     was_alerted = {}
     message_log = []
-    routes = []  # Store all routes for batch execution
-    last_reset_time = datetime.datetime.now()
+    routes = []
     
+    # Sleep clamps
+    MIN_SLEEP = 10 * 60      # Minimum 10 minutes (prevents spamming on low wine)
+    MAX_SLEEP = 6 * 60 * 60  # Maximum 6 hours (sanity check for manual changes)
+
     while True:
-        current_time = datetime.datetime.now()
-        time_elapsed = (current_time - last_reset_time).total_seconds()
-        if time_elapsed >= 12 * 60 * 60:  # 12 h to reset the alerted list
-            was_alerted.clear()  # Reset all alerts
-            last_reset_time = current_time  # Update the last time reseted the list
-            
         ids, cities = getIdsOfCities(session)
 
         for cityId in cities:
             if cityId not in was_alerted:
                 was_alerted[cityId] = False
 
+        seconds_until_next_event = []
+
         for cityId in cities:
             html = session.get(city_url + cityId)
             city = getCity(html)
 
+            # Skip cities without a tavern
             if "tavern" not in [building["building"] for building in city["position"]]:
                 continue
 
             consumption_per_hour = getWineConsumptionPerHour(html)
 
-            # Determine Wine Press reduction
+            # Determine Wine Press / Vineyard reduction
             wine_press_level = 0
             for building in city["position"]:
                 if building.get("building") == "vineyard":
                     wine_press_level = building.get("level", 0)
                     break
 
-            # Apply reduction to wine consumption
             reduction_factor = Decimal(1 - (wine_press_level / 100))
             consumption_per_hour *= reduction_factor
 
             wine_available = Decimal(city["availableResources"][1])
-
             consumption_net = Decimal(consumption_per_hour)
 
-            if consumption_net == 0:
+            if consumption_net <= 0:
                 was_alerted[cityId] = False
                 continue
 
             consumption_per_seg = consumption_net / Decimal(3600)
             seconds_left = wine_available / consumption_per_seg
+            threshold_seconds = Decimal(hours * 3600)
 
-            if seconds_left < hours * 60 * 60:
-                if was_alerted[cityId] is False:
+            # Case 1: Wine is at or below the alert threshold
+            if seconds_left <= threshold_seconds:
+                if not was_alerted[cityId]:
                     time_left = daysHoursMinutes(seconds_left)
-                    message_log.append(f"In {city['name']} you have: {city['availableResources'][1]:,.0f} wine. Consumption: {consumption_per_hour:.2f} per hour.\nThe wine will run out in {time_left}")
+                    message_log.append(
+                        f"In {city['name']} you have: {city['availableResources'][1]:,.0f} wine. "
+                        f"Consumption: {consumption_per_hour:.2f}/h.\n"
+                        f"The wine will run out in {time_left}."
+                    )
 
                     if auto_transfer:
                         transport_status = isWineTransportInProgress(session, cityId)
                         if transport_status:
                             message_log.append(transport_status)
-                            message_log.append(f"A wine transport is already in progress to {city['name']}. No additional transport initiated.")
+                            message_log.append(f"Transport already en route to {city['name']}. No additional transport initiated.")
                             was_alerted[cityId] = True
+                            seconds_until_next_event.append(30 * 60)
                             continue
 
+                        # Find the donor city with the most surplus wine
                         donor_city_id = None
                         donor_city = None
-
-                        # Find the donor city among wine-producing cities with the most wine available
                         max_wine_available = 0
+
                         for donor_id, donor in cities.items():
+                            if donor_id == cityId:
+                                continue
+
                             wood_prod, luxury_prod, tradegood = getProductionPerHour(session, donor_id)
-                                
-                            if tradegood != 1:  # Skip if not wine-producing
+                            if tradegood != 1:  # 1 = Wine producing
                                 continue
 
                             donor_html = session.get(city_url + donor_id)
                             donor_info = getCity(donor_html)
 
-                            if donor_id == cityId:
-                                continue
-
-                            # Check if the city has enough wine to send
-                            wine_available = donor_info.get("availableResources", [0, 0, 0, 0, 0])[1]
-                            if wine_available >= transfer_amount and wine_available > max_wine_available:
+                            donor_wine = donor_info.get("availableResources", [0, 0, 0, 0, 0])[1]
+                            if donor_wine >= transfer_amount and donor_wine > max_wine_available:
                                 donor_city_id = donor_id
                                 donor_city = donor
-                                max_wine_available = wine_available
+                                max_wine_available = donor_wine
 
                         if donor_city_id:
                             routes.append((
-                                donor_city,  # Origin
-                                city,  # Destination
-                                city["islandId"],  # Island ID
-                                0,  # Wood
-                                transfer_amount,  # Wine
-                                0,  # Marble
-                                0,  # Crystal
-                                0,  # Sulfur
+                                donor_city,
+                                city,
+                                city["islandId"],
+                                0,
+                                transfer_amount,
+                                0,
+                                0,
+                                0,
                             ))
-                            
-                            message_log.append(f"Will transfer {transfer_amount:,d} from {donor_city['name']}.")
-
+                            message_log.append(f"Will transfer {transfer_amount:,d} wine from {donor_city['name']}.")
+                            seconds_until_next_event.append(30 * 60)
                         else:
-                            message_log.append(f"No city has sufficient wine to transfer to {city['name']}.")
+                            message_log.append(f"No donor city has {transfer_amount:,d} wine available for {city['name']}.")
+                            seconds_until_next_event.append(min(float(seconds_left), 3600))
 
                     was_alerted[cityId] = True
+                else:
+                    # Already alerted: next milestone is total depletion
+                    if seconds_left > 0:
+                        seconds_until_next_event.append(float(seconds_left))
             else:
+                # Case 2: Wine is safe -> calculate time until it reaches threshold
                 was_alerted[cityId] = False
+                time_to_threshold = float(seconds_left - threshold_seconds)
+                seconds_until_next_event.append(time_to_threshold)
 
+        # Send Telegram notifications
         if message_log:
-            
             sendToBot(session, "\n".join(message_log))
             message_log.clear()
 
+        # Dispatch transport routes
         if routes:
             executeRoutes(session, routes, useFreighters=False)
             routes.clear()
-        time.sleep(60 * 60)
+            seconds_until_next_event.append(20 * 60)
+
+        # Calculate optimal sleep time
+        if seconds_until_next_event:
+            calculated_sleep = min(seconds_until_next_event)
+        else:
+            calculated_sleep = MAX_SLEEP
+
+        # Clamp between MIN_SLEEP (10m) and MAX_SLEEP (6h)
+        sleep_duration = max(MIN_SLEEP, min(int(calculated_sleep), MAX_SLEEP))
+
+        next_wake = datetime.datetime.now() + datetime.timedelta(seconds=sleep_duration)
+        session.setStatus(f"Wine OK. Next check in {daysHoursMinutes(sleep_duration)} (at {next_wake.strftime('%H:%M')})")
+
+        time.sleep(sleep_duration)

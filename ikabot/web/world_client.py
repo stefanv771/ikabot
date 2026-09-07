@@ -1,12 +1,19 @@
 # ikabot/web/world_client.py
 import re
 import json
-import requests
 from typing import Optional, Dict
+
+# Prefer curl_cffi for browser TLS impersonation, fallback to standard requests
+try:
+    from curl_cffi import requests
+    TLS_IMPERSONATION = True
+except ImportError:
+    import requests
+    TLS_IMPERSONATION = False
 
 
 class WorldClient:
-    """Handles direct communication with a specific Ikariam game world server."""
+    """Handles direct communication with a specific Ikariam game world server using Chrome TLS."""
 
     def __init__(self, serv_number: int, serv_lang: str):
         self.serv_number = serv_number
@@ -14,7 +21,11 @@ class WorldClient:
         self.host = f"s{serv_number}-{serv_lang}.ikariam.gameforge.com"
         self.url_base = f"https://{self.host}/index.php?"
         
-        self.session = requests.Session()
+        if TLS_IMPERSONATION:
+            self.session = requests.Session(impersonate="chrome120")
+        else:
+            self.session = requests.Session()
+
         self._setup_headers()
 
     def _setup_headers(self):
@@ -30,19 +41,11 @@ class WorldClient:
 
     def set_session_cookie(self, cookie_value: str):
         """Sets the 'ikariam' session cookie manually or from login exchange."""
-        cookie_obj = requests.cookies.create_cookie(
-            domain=self.host,
-            name="ikariam",
-            value=cookie_value.strip()
-        )
-        self.session.cookies.set_cookie(cookie_obj)
+        self.session.cookies.set("ikariam", cookie_value.strip(), domain=self.host)
 
     def login_via_url(self, login_url: str) -> bool:
-        """
-        Hits the Gameforge SSO redirect URL to automatically acquire world cookies.
-        """
+        """Hits the Gameforge SSO redirect URL to automatically acquire world cookies."""
         resp = self.session.get(login_url, allow_redirects=True, timeout=30)
-        # Verify that the 'ikariam' cookie was set in our session jar
         return "ikariam" in self.session.cookies
 
     def is_expired(self, text: str) -> bool:
@@ -50,13 +53,11 @@ class WorldClient:
         return "index.php?logout" in text or '<a class="logout"' in text or not text
 
     def extract_action_request(self, text: str) -> Optional[str]:
-        """Extracts the non-empty CSRF actionRequest token from the page."""
-        # Find all occurrences of actionRequest: "token" or actionRequest="token" (32 hex characters)
+        """Extracts the non-empty 32-character CSRF actionRequest token from the page."""
         matches = re.findall(r'actionRequest["\']?\s*[:=]\s*["\']([a-f0-9]{32})["\']', text, re.IGNORECASE)
         if matches:
             return matches[0]
             
-        # Fallback: find any non-empty alphanumeric token
         fallback_matches = [m for m in re.findall(r'actionRequest["\']?\s*[:=]\s*["\']([^"\']+)["\']', text, re.IGNORECASE) if m.strip()]
         return fallback_matches[0] if fallback_matches else None
 
@@ -80,13 +81,36 @@ class WorldClient:
         return city_info
 
     def get(self, query: str = "", params: Optional[Dict] = None) -> str:
-        """Sends a GET request to the game server and returns the HTML/JSON text."""
+        """Sends a GET request to the game server."""
         url = self.url_base + query
         resp = self.session.get(url, params=params or {}, timeout=30)
         
         if self.is_expired(resp.text):
             raise ConnectionResetError("Game session expired. Need to refresh cookies.")
             
+        return resp.text
+
+    def post(self, query: str = "", payload: Optional[Dict] = None, params: Optional[Dict] = None) -> str:
+        """Sends a POST request to Ikariam, automatically injecting the CSRF actionRequest token."""
+        payload = payload or {}
+        params = params or {}
+
+        html = self.get_city_view()
+        token = self.extract_action_request(html)
+        if not token:
+            raise RuntimeError("Could not retrieve a valid actionRequest CSRF token.")
+
+        if "actionRequest" in payload:
+            payload["actionRequest"] = token
+        if "actionRequest" in params:
+            params["actionRequest"] = token
+
+        url = self.url_base + query
+        resp = self.session.post(url, data=payload, params=params, timeout=30)
+
+        if self.is_expired(resp.text):
+            raise ConnectionResetError("Session expired during POST action.")
+
         return resp.text
 
     def get_city_view(self) -> str:
