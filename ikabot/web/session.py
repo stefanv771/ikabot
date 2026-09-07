@@ -156,8 +156,12 @@ class Session:
         self.mundo = str(self.account["server"]["number"])
         self.servidor = self.login_servidor
         
-        # Initialize Cross-Account Action Lock
-        self.action_lock = GlobalActionLock(username=self.username, min_delay_seconds=15)
+        # Initialize Server-Scoped Action Lock for this specific game world
+        self.action_lock = GlobalActionLock(
+            username=self.username,
+            server=f"s{self.mundo}-{self.servidor}",
+            min_delay_seconds=15
+        )
 
         # 3. Initialize World Client
         self.world_client = WorldClient(serv_number=int(self.mundo), serv_lang=self.servidor)
@@ -165,7 +169,7 @@ class Session:
         self.urlBase = self.world_client.url_base
         self.s = self.world_client.session
 
-        # 4. Check for cached world cookies for this specific account
+        # 4. Check for cached world cookies partitioned by account ID and server
         account_storage_key = f"cookies_{self.account['id']}_{self.mundo}_{self.servidor}"
         accountSessionData = self.getSessionData()
         cached_cookies = accountSessionData.get(account_storage_key, {})
@@ -184,12 +188,12 @@ class Session:
             try:
                 test_html = self.world_client.get_city_view()
                 if not self.world_client.is_expired(test_html):
-                    print(f"[+] CACHE HIT: Reusing active world session for {self.username}.")
+                    print(f"[+] CACHE HIT: Reusing active world session for {self.username}. (Zero logins needed!)")
                     used_cached_cookie = True
             except Exception as e:
                 print(f"[-] Cached world session check failed: {e}")
 
-        # 5. Automated SSO Login Redirect
+        # 5. Automated SSO Login Redirect (Only if cache was empty or expired)
         if not used_cached_cookie:
             print(f"[*] Generating new SSO session redirect for {self.username}...")
             if not blackbox:
@@ -215,7 +219,7 @@ class Session:
                 manual_cookie = read(msg="Enter 'ikariam' cookie manually: ").strip()
                 self.world_client.set_session_cookie(manual_cookie)
 
-            # Save cookies partitioned by account ID
+            # Persist the freshly acquired cookies partitioned by account ID
             accountSessionData[account_storage_key] = dict(self.s.cookies.items())
             self.setSessionData(accountSessionData)
             print(f"[+] Saved fresh session cookies for {self.username}.")
@@ -248,7 +252,7 @@ class Session:
         """Sends a POST request to the game server with automatic CSRF actionRequest injection and action queueing."""
         wait_if_globally_paused(getattr(self, "username", None))
 
-        # Enforce multi-account human cooldown
+        # Enforce server-scoped multi-account human cooldown
         if getattr(self, "action_lock", None):
             self.action_lock.wait_turn()
 
