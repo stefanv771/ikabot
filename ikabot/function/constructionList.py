@@ -17,6 +17,7 @@ from functools import cache
 
 from ikabot.config import *
 from ikabot.helpers.botComm import *
+from ikabot.helpers.crossAccountLock import acquire_activity_lock, release_activity_lock
 from ikabot.helpers.getJson import getCity
 from ikabot.helpers.gui import *
 from ikabot.helpers.pedirInfo import *
@@ -30,6 +31,9 @@ from ikabot.web.session import normal_get
 sendResources = True
 expand = True
 thread = None
+
+WINE_INDEX = 1  # in materials_names, index 1 is always "Wine"
+WINE_RESERVE = 10000  # amount of wine that must remain in the city after the upgrade
 
 
 def waitForConstruction(session, city_id, final_lvl):
@@ -62,6 +66,10 @@ def waitForConstruction(session, city_id, final_lvl):
         final_time = int(construction_time)
         seconds_to_wait = final_time - current_time
 
+        # randomized human-like pause (1-5 min) before requesting the next
+        # level, instead of a fixed 10-second buffer every single time
+        post_construction_delay = random.randint(60, 300)
+
         msg = "{}: I wait {:d} seconds so that {} gets to the level {:d}".format(
             city["cityName"],
             seconds_to_wait,
@@ -70,9 +78,9 @@ def waitForConstruction(session, city_id, final_lvl):
         )
         sendToBotDebug(session, msg, debugON_constructionList)
         session.setStatus(
-            f"Waiting until {getDateTime(time.time()+seconds_to_wait+10)[8:]}, {construction_building['name']} {construction_building['level']} -> {construction_building['level']+1} in {city['name']}, final lvl: {final_lvl}"
+            f"Waiting until {getDateTime(time.time()+seconds_to_wait+post_construction_delay)[8:]}, {construction_building['name']} {construction_building['level']} -> {construction_building['level']+1} in {city['name']}, final lvl: {final_lvl}"
         )
-        wait(seconds_to_wait + 10)
+        wait(seconds_to_wait + post_construction_delay)
 
     html = session.get(city_url + city_id)
     city = getCity(html)
@@ -130,10 +138,22 @@ def expandBuilding(session, cityId, building, waitForResources):
             cityId,
             building["building"],
         )
-        resp = session.post(url)
-        html = session.get(city_url + cityId)
-        city = getCity(html)
-        building = city["position"][position]
+
+        # cross-account lock: only around the short-lived action itself
+        # (the upgrade request + its confirmation fetch), never around
+        # the long waitForConstruction() wait above - so this account
+        # doesn't block the other 5 accounts for hours at a time, just
+        # for the few seconds it takes to actually send this request
+        lock_acquired = acquire_activity_lock(session.username)
+        try:
+            resp = session.post(url)
+            html = session.get(city_url + cityId)
+            city = getCity(html)
+            building = city["position"][position]
+        finally:
+            if lock_acquired:
+                release_activity_lock()
+
         if building["isBusy"] is False:
             msg = "{}: The building {} was not extended".format(
                 city["cityName"], building["name"]
@@ -296,11 +316,17 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
             # get hash from CDN images to identify the resource type
             resource_type = checkhash("https:" + resources_types[i] + ".png")
 
+            resource_index = None
             for j in range(len(materials_names_tec)):
                 name = materials_names_tec[j]
                 if resource_type == name:
                     resource_index = j
                     break
+
+            if resource_index is None:
+                # unrecognized resource type for this cost line - skip it
+                # instead of crashing or reusing the previous line's index
+                continue
 
             # get the cost of the current resource type
             cost = costs[i]
@@ -487,6 +513,53 @@ def chooseResourceProviders(session, cities_ids, cities, city_id, resource, miss
     return origin_cities
 
 
+WAREHOUSE_CAPACITY_KEY = "storageCapacity"
+# confirmed via ikabot/helpers/getJson.py: getCity() sets
+# city["storageCapacity"] = getWarehouseCapacity(html)
+
+
+def getWarehouseCapacity(city):
+    """
+    Parameters
+    ----------
+    city : dict
+
+    Returns
+    -------
+    capacity : int or None
+        Maximum storage capacity per resource (same cap for all resources
+        in Ikariam), or None if the key wasn't found.
+    """
+    return city.get(WAREHOUSE_CAPACITY_KEY)
+
+
+def getResourcesOverCapacity(city, resourcesNeeded):
+    """
+    Parameters
+    ----------
+    city : dict
+    resourcesNeeded : list[int]
+
+    Returns
+    -------
+    over_capacity : list of tuple (str, int, int)
+        List of (resource_name, needed, capacity) for each resource whose
+        requirement exceeds the warehouse capacity. Empty list if the
+        warehouse is sufficient for everything, or if the capacity
+        couldn't be determined.
+    """
+    capacity = getWarehouseCapacity(city)
+    if capacity is None:
+        return []
+
+    over_capacity = []
+    for i, needed in enumerate(resourcesNeeded):
+        if needed > capacity:
+            over_capacity.append((materials_names[i], needed, capacity))
+
+    return over_capacity
+
+
 def sendResourcesMenu(session, city_id, missing, useFreighters=False, useRounding=False):
     """
     Parameters
@@ -610,6 +683,7 @@ def getBuildingsToExpand(session, cityId):
 @cache
 def checkhash(url):
     m = hashlib.md5()
+    material = None
     r = requests.get(url)
     for data in r.iter_content(8192):
         m.update(data)
@@ -697,10 +771,25 @@ def constructionList(session, event, stdin_fd, predetermined_input):
                 event.set()
                 return
 
+            # check whether the current warehouse can store the required resources
+            over_capacity = getResourcesOverCapacity(city, resourcesNeeded)
+            if over_capacity:
+                print("[WARNING] The warehouse doesn't have enough capacity for:")
+                for name, needed, cap in over_capacity:
+                    print("  - {}: needed {}, warehouse capacity {} -> upgrade the Warehouse!".format(
+                        name.lower(), addThousandSeparator(needed), addThousandSeparator(cap)
+                    ))
+                print("")
+
             missing = [0] * len(materials_names)
             for i in range(len(materials_names)):
-                if simulated_resources[i] < resourcesNeeded[i]:
-                    missing[i] = resourcesNeeded[i] - simulated_resources[i]
+                available = simulated_resources[i]
+                if i == WINE_INDEX:
+                    # keep an untouched wine reserve as a buffer for tavern
+                    # consumption while waiting for the transport
+                    available = max(0, available - WINE_RESERVE)
+                if available < resourcesNeeded[i]:
+                    missing[i] = resourcesNeeded[i] - available
 
             # show missing resources to the user
             if sum(missing) > 0:
