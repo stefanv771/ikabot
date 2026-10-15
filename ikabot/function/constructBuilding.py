@@ -1,4 +1,3 @@
-from ikabot.helpers.decorators import configurator
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 
@@ -6,10 +5,44 @@ from ikabot.helpers.decorators import configurator
 import json
 import re
 
+from ikabot.helpers.decorators import configurator, task
+from ikabot.helpers.botComm import sendToBot
+from ikabot.helpers.signals import setInfoSignal
 from ikabot.config import *
 from ikabot.helpers.gui import *
 from ikabot.helpers.pedirInfo import *
 from ikabot.helpers.varios import addThousandSeparator
+from ikabot.helpers.getJson import getCity
+from ikabot.function.constructionList import (
+    _constructionRequirements, getResourcesOverCapacity,
+    sendResourcesMenu, sendResourcesNeeded,
+)
+from ikabot.helpers.planRoutes import getMinimumWaitingTime
+from ikabot.helpers.varios import wait
+
+
+def supplyBuildingResources(session, city, costs):
+    """Collect transport choices without sending or waiting in the menu."""
+    required = _constructionRequirements(session, city, costs)
+    over_capacity = getResourcesOverCapacity(city, required)
+    if over_capacity:
+        print("Insufficient storage for construction costs plus wine reserve:")
+        for name, needed, capacity in over_capacity:
+            print(f"- {name}: needed {needed:,}, capacity {capacity:,}. Upgrade storage first.")
+        return None
+    missing = [max(0, need - have) for need, have in zip(required, city["availableResources"])]
+    if not any(missing):
+        return {"origins": None, "missing": missing, "useFreighters": False}
+    print("\nAutomatically transport missing resources? [Y/n]")
+    if read(values=["y", "Y", "n", "N", ""]).lower() == "n":
+        return None
+    print("Ship type: (1) Trade ships (2) Freighters")
+    ship_type = read(min=1, max=2, digit=True, default=1)
+    origins, proceed = sendResourcesMenu(session, city["id"], missing)
+    if not proceed or not origins:
+        return None
+    return {"origins": origins, "missing": missing, "useFreighters": ship_type == 2}
+
 
 
 def parseBuildingCosts(html_block):
@@ -208,10 +241,15 @@ def constructBuilding(session, event, stdin_fd, predetermined_input):
                     )
                 if not any_missing:
                     print("You have enough resources for this building.")
-                print("\nPress Enter to return to the menu...")
-                enter()
-                continue
+                supplied = supplyBuildingResources(session, city, selected_building["costs"])
+                if supplied is None:
+                    continue
+                break
             else:
+                city = getCity(session.get(city_url + str(city["id"])))
+                supplied = supplyBuildingResources(session, city, selected_building["costs"])
+                if supplied is None:
+                    continue
                 break
         building = selected_building
         banner()
@@ -222,6 +260,10 @@ def constructBuilding(session, event, stdin_fd, predetermined_input):
             if position_id["building"] == "empty"
             and position_id["type"] == building["type"]
         ]
+        if not options:
+            print("No free position remains for this building.")
+            enter()
+            return
         if len(options) == 1:
             option = options[0]
         else:
@@ -234,34 +276,91 @@ def constructBuilding(session, event, stdin_fd, predetermined_input):
             option = options[selected_building_index - 1]
             banner()
 
-        # build it
-        params = {
-            "action": "BuildNewBuilding",
-            "cityId": city["id"],
-            "position": option["position"],
-            "building": building["buildingId"],
-            "backgroundView": "city",
-            "currentCityId": city["id"],
-            "templateView": "buildingGround",
-            "actionRequest": current_action_request,
-            "ajax": "1",
-        }
-        buildings_response = session.post(params=params, noIndex=True)
-        response_data = json.loads(buildings_response, strict=False)
-        msg = None
-        for item in response_data:
-            if item[0] == 'provideFeedback':
-                for feedback in item[1]:
-                    if feedback.get('text'):
-                        msg = feedback['text']
-                        break
-                if msg:
-                    break
-        if not msg:
-            msg = "Building process completed."
-        print(msg)
-        enter()
-        event.set()
+        print("Construction queued in background. You can return to the main menu.")
+        return {"session": session, "city": city, "building": building,
+                "option": option, "current_action_request": current_action_request,
+                "supply": supplied}
     except KeyboardInterrupt:
         event.set()
         return
+
+
+@task("constructBuilding")
+def buildInBackground(session, city, building, option, current_action_request, supply):
+    setInfoSignal(session, f"Build {building['name']} in {city.get('name', city['id'])}")
+    if supply["origins"]:
+        session.setStatus("Sending construction resources")
+        sendResourcesNeeded(session, city["id"], supply["origins"], supply["missing"],
+                            useFreighters=supply["useFreighters"])
+    while True:
+        city = getCity(session.get(city_url + str(city["id"])))
+        slot = next((b for b in city["position"] if b["position"] == option["position"]), None)
+        if slot is None or slot["building"] != "empty":
+            sendToBot(session, "Construction cancelled: the selected position is no longer empty.")
+            return
+        required = _constructionRequirements(session, city, building["costs"])
+        if getResourcesOverCapacity(city, required):
+            sendToBot(session, "Construction cancelled: storage cannot hold costs plus wine reserve.")
+            return
+        if all(have >= need for have, need in zip(city["availableResources"], required)):
+            break
+        seconds = getMinimumWaitingTime(session)
+        if seconds <= 0:
+            sendToBot(session, "Construction cancelled: insufficient resources and no transport detected.")
+            return
+        session.setStatus("Waiting for construction resources to arrive")
+        wait(seconds + 5)
+    # Refresh the selected slot, costs and action token after transport waits.
+    response = json.loads(session.post(params={
+        "view": "buildingGround", "cityId": city["id"],
+        "position": option["position"], "backgroundView": "city",
+        "currentCityId": city["id"], "actionRequest": current_action_request,
+        "ajax": "1",
+    }, noIndex=True), strict=False)
+    fresh_html = None
+    for item in response:
+        if item[0] == "updateGlobalData":
+            current_action_request = item[1].get("actionRequest", current_action_request)
+        elif item[0] == "changeView" and isinstance(item[1], list):
+            fresh_html = item[1][1]
+    fresh_block = next((block for block in splitBuildingBlocks(fresh_html or "")
+                        if block["type"] == building["building"]), None)
+    if fresh_block is None:
+        sendToBot(session, "This building is no longer available in the selected position.")
+        return
+    fresh_costs = parseBuildingCosts(fresh_block["html"])
+    city = getCity(session.get(city_url + str(city["id"])))
+    slot = next((b for b in city["position"] if b["position"] == option["position"]), None)
+    if slot is None or slot["building"] != "empty":
+        sendToBot(session, "Construction cancelled: the selected position is no longer empty.")
+        return
+    required = _constructionRequirements(session, city, fresh_costs)
+    if any(have < need for have, need in zip(city["availableResources"], required)):
+        sendToBot(session, "Resources changed; construction cancelled to protect reserved stock. Please retry.")
+        return
+    # build it
+    params = {
+        "action": "BuildNewBuilding",
+        "cityId": city["id"],
+        "position": option["position"],
+        "building": building["buildingId"],
+        "backgroundView": "city",
+        "currentCityId": city["id"],
+        "templateView": "buildingGround",
+        "actionRequest": current_action_request,
+        "ajax": "1",
+    }
+    buildings_response = session.post(params=params, noIndex=True)
+    response_data = json.loads(buildings_response, strict=False)
+    msg = None
+    for item in response_data:
+        if item[0] == 'provideFeedback':
+            for feedback in item[1]:
+                if feedback.get('text'):
+                    msg = feedback['text']
+                    break
+            if msg:
+                break
+    if not msg:
+        msg = f"Construction request sent for {building['name']} in city {city['id']}."
+    sendToBot(session, msg)
