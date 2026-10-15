@@ -231,6 +231,7 @@ def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
     -------
     city : dict
     """
+    observed_construction = False
     while True:
 
         html = session.get(city_url + city_id)
@@ -240,8 +241,13 @@ def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
             building for building in city["position"] if "completed" in building
         ]
         if len(construction_buildings) == 0:
+            if observed_construction:
+                post_construction_delay = random.randint(60, 300)
+                session.setStatus(f"Construction finished. Waiting {post_construction_delay} seconds before continuing.")
+                wait(post_construction_delay)
             break
 
+        observed_construction = True
         construction_building = construction_buildings[0]
         construction_time = construction_building["completed"]
 
@@ -281,7 +287,7 @@ def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
         if CONSTRUCTION_FREE_SPEEDUP:
             wait(max(5, seconds_to_wait - 300))
         else:
-            wait(max(5, seconds_to_wait + 10))
+            wait(max(5, seconds_to_wait))
 
     html = session.get(city_url + city_id)
     city = getCity(html)
