@@ -28,6 +28,73 @@ from ikabot.helpers.signals import setInfoSignal
 from ikabot.helpers.varios import *
 from ikabot.web.session import normal_get
 from ikabot.helpers.decorators import configurator, task
+from ikabot.function.tavernManager import TavernManager
+
+
+WINE_INDEX = 1
+WINE_RESERVE = 10000
+WINE_RESERVE_HOURS = 24
+# Planning margin only; the live check remains authoritative after transports.
+WINE_TRANSPORT_BUFFER_HOURS = 1
+
+
+def getWineReserve(session, city, waiting_seconds=0):
+    consumption = Decimal(str(city.get("wineConsumptionPerHour", 0)))
+    tavern = next((b for b in city["position"] if b["building"] == "tavern"), None)
+    if consumption <= 0 and tavern is not None:
+        data = TavernManager(session)._get_tavern_data(city, tavern, force_refresh=True)
+        if not data or not data["consumption_values"]:
+            raise ValueError("Cannot determine maximum tavern consumption; wine spending blocked.")
+        # A depleted city may shortly resume serving at 100%.
+        consumption = Decimal(max(wine for level, wine in data["consumption_values"]))
+    consumption = max(Decimal(0), consumption)
+    reserve = max(WINE_RESERVE, math.ceil(consumption * WINE_RESERVE_HOURS))
+    return reserve + math.ceil(consumption * Decimal(str(max(0, waiting_seconds))) / 3600)
+
+
+def getResourcesOverCapacity(city, resourcesNeeded):
+    capacity = city.get("storageCapacity")
+    if capacity is None:
+        return []
+    listed = city.get("resourcesListedForSale", [0] * len(materials_names))
+    return [(materials_names[i], needed, max(0, capacity - listed[i]))
+            for i, needed in enumerate(resourcesNeeded)
+            if needed > max(0, capacity - listed[i])]
+
+
+def _constructionRequirements(session, city, costs, waiting_seconds=0):
+    required = list(costs)
+    if required[WINE_INDEX] > 0:
+        required[WINE_INDEX] += getWineReserve(session, city, waiting_seconds)
+    return required
+
+
+def _waitForWineReserve(session, city, building, wait_for_resources):
+    """Re-read live costs and stock for each level; never spend the reserve."""
+    notified = False
+    while True:
+        costs = getResourcesNeeded(session, city, dict(building), building["level"], building["level"] + 1)
+        if any(cost < 0 for cost in costs):
+            return None
+        required = _constructionRequirements(session, city, costs)
+        over_capacity = getResourcesOverCapacity(city, required)
+        if over_capacity:
+            sendToBot(session, f"{city['cityName']}: construction paused. Insufficient storage (cost plus wine reserve): {over_capacity}. Upgrade storage first.")
+            return None
+        if costs[WINE_INDEX] == 0 or city["availableResources"][WINE_INDEX] >= required[WINE_INDEX]:
+            return city
+        if not notified:
+            sendToBot(session, f"{city['cityName']}: construction paused to protect wine. Need {required[WINE_INDEX]:,}, have {city['availableResources'][WINE_INDEX]:,}.")
+            notified = True
+        if not wait_for_resources:
+            return None
+        seconds = getMinimumWaitingTime(session)
+        if seconds <= 0:
+            sendToBot(session, f"{city['cityName']}: no transport detected; construction stopped without spending the wine reserve.")
+            return None
+        wait(seconds + 5)
+        city = getCity(session.get(city_url + str(city["id"])))
+        building = city["position"][building["position"]]
 
 
 def _parseConstructionTime(row):
@@ -264,6 +331,13 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
             sendToBot(session, msg)
             return
 
+        city = _waitForWineReserve(session, city, building, waitForResources)
+        if city is None:
+            return
+        building = city["position"][position]
+        if not building["canUpgrade"]:
+            sendToBot(session, f"{city['cityName']}: construction stopped; resources changed while waiting for wine.")
+            return
         url = "action=UpgradeExistingBuilding&actionRequest={}&cityId={}&position={:d}&level={}&activeTab=tabSendTransporter&backgroundView=city&currentCityId={}&templateView={}&ajax=1".format(
             actionRequest,
             cityId,
@@ -532,6 +606,8 @@ def sendResourcesNeeded(session, destination_city_id, city_origins, missing_reso
         # build combined routes per origin city so multiple resources
         # from the same city are sent in a single shipment
         combined = {}  # origin_city_id -> (cityOrigin, toSend_list)
+        refreshed_origins = {}
+        room = list(cityD.get("freeSpaceForResources", [max(0, cityD.get("storageCapacity", 0) - amount) for amount in cityD["availableResources"]]))
 
         for i in range(len(materials_names)):
             missing = missing_resources[i]
@@ -539,27 +615,43 @@ def sendResourcesNeeded(session, destination_city_id, city_origins, missing_reso
                 continue
 
             target = _round_up_resources(missing) if useRounding else missing
+            if target > room[i]:
+                sendToBot(session, f"{cityD['cityName']}: insufficient free storage for {materials_names[i]} shipment ({target:,} requested, {room[i]:,} free). Shipment capped.")
+                target = max(0, room[i])
             remaining = target
 
             for cityOrigin in city_origins[i]:
                 if remaining == 0:
                     break
 
+                origin_id = cityOrigin["id"]
+                if origin_id not in refreshed_origins:
+                    refreshed_origins[origin_id] = getCity(session.get(city_url + str(origin_id)))
+                cityOrigin = refreshed_origins[origin_id]
                 available = cityOrigin["availableResources"][i]
+                if i == WINE_INDEX:
+                    available = max(0, available - getWineReserve(session, cityOrigin))
                 send = min(available, remaining)
+                if send <= 0:
+                    continue
                 remaining -= send
 
                 city_id = cityOrigin["id"]
                 if city_id not in combined:
                     combined[city_id] = (cityOrigin, [0] * len(materials_names))
                 combined[city_id][1][i] += send
+                cityOrigin["availableResources"][i] -= send
+
+            if remaining > 0:
+                sendToBot(session, f"{cityD['cityName']}: {remaining:,} {materials_names[i]} could not be supplied without using protected stock. Construction will recheck resources before upgrading.")
 
         routes = []
         for city_id, (cityOrigin, toSend) in combined.items():
             route = (cityOrigin, cityD, cityD["islandId"], *toSend)
             routes.append(route)
 
-        executeRoutes(session, routes, useFreighters)
+        if routes:
+            executeRoutes(session, routes, useFreighters)
     except Exception as e:
         msg = "Error in:\n{}\nCause:\n{}".format(info, traceback.format_exc())
         sendToBot(session, msg)
@@ -598,6 +690,8 @@ def chooseResourceProviders(session, cities_ids, cities, city_id, resource, miss
         city = getCity(html)
 
         available = city["availableResources"][resource]
+        if resource == WINE_INDEX:
+            available = max(0, available - getWineReserve(session, city))
         if available == 0:
             continue
 
@@ -873,10 +967,21 @@ def constructionList(session, event, stdin_fd, predetermined_input):
         if -1 in resourcesNeeded:
             return None
 
+        waiting_seconds = max(0, city.get("endUpgradeTime", 0) - time.time())
+        waiting_seconds += sum(b.get("constructionTime", 0) for b in confirmed_buildings)
+        waiting_seconds += WINE_TRANSPORT_BUFFER_HOURS * 3600
+        required = _constructionRequirements(session, city, resourcesNeeded, waiting_seconds)
+        over_capacity = getResourcesOverCapacity(city, required)
+        if over_capacity:
+            print("[WARNING] Insufficient storage for the planned resources, including wine reserve and consumption margin:")
+            for name, needed, capacity in over_capacity:
+                print(f"  - {name}: needed {needed:,}, capacity {capacity:,}. Upgrade storage or shorten the construction list.")
+        if resourcesNeeded[WINE_INDEX] > 0:
+            print(f"Wine protected (reserve plus waiting margin): {required[WINE_INDEX] - resourcesNeeded[WINE_INDEX]:,}")
         missing = [0] * len(materials_names)
         for i in range(len(materials_names)):
-            if simulated_resources[i] < resourcesNeeded[i]:
-                missing[i] = resourcesNeeded[i] - simulated_resources[i]
+            if simulated_resources[i] < required[i]:
+                missing[i] = required[i] - simulated_resources[i]
 
         # show missing resources to the user
         if sum(missing) > 0:
