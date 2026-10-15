@@ -154,8 +154,8 @@ def executeRoutes(session, routes, useFreighters=False):
             resources_to_send = sum(send)
             if resources_to_send == 0:
                 # no space available
-                # wait an hour and try again
-                wait(60 * 60)
+                # Retry after a randomized 45-75 minutes when storage is full.
+                wait(random.randint(45 * 60, 75 * 60))
                 continue
 
             if useFreighters is False:
@@ -175,7 +175,7 @@ def executeRoutes(session, routes, useFreighters=False):
                 send,
                 useFreighters,
             )
-            time.sleep(random.randint(5, 15))
+            time.sleep(random.randint(60, 300))
 
 
 def splitCargoBetweenFleets(session, toSend):
