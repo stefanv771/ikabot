@@ -19,6 +19,7 @@ from ikabot.helpers.signals import setInfoSignal
 from ikabot.helpers.varios import daysHoursMinutes
 from ikabot.helpers.planRoutes import *
 from ikabot.function.tavernManager import TavernManager
+from ikabot.helpers.wineReserve import getWineReserve
 
 getcontext().prec = 30
 
@@ -214,7 +215,7 @@ def do_it(session, hours, auto_transfer, transfer_amount):
                             donor_info = getCity(donor_html)
 
                             # Check if the city has enough wine to send
-                            wine_available = donor_info.get("availableResources", [0, 0, 0, 0, 0])[1]
+                            wine_available = max(0, donor_info.get("availableResources", [0, 0, 0, 0, 0])[1] - getWineReserve(session, donor_info))
                             if wine_available >= transfer_amount and wine_available > max_wine_available:
                                 donor_city_id = donor_id
                                 donor_city = donor
