@@ -19,6 +19,7 @@ from ikabot.function.constructionList import (
 )
 from ikabot.helpers.planRoutes import getMinimumWaitingTime
 from ikabot.helpers.varios import wait
+from ikabot.helpers.activityCoordinator import activity
 
 
 def supplyBuildingResources(session, city, costs):
@@ -310,57 +311,58 @@ def buildInBackground(session, city, building, option, current_action_request, s
             return
         session.setStatus("Waiting for construction resources to arrive")
         wait(seconds + 5)
-    # Refresh the selected slot, costs and action token after transport waits.
-    response = json.loads(session.post(params={
-        "view": "buildingGround", "cityId": city["id"],
-        "position": option["position"], "backgroundView": "city",
-        "currentCityId": city["id"], "actionRequest": current_action_request,
-        "ajax": "1",
-    }, noIndex=True), strict=False)
-    fresh_html = None
-    for item in response:
-        if item[0] == "updateGlobalData":
-            current_action_request = item[1].get("actionRequest", current_action_request)
-        elif item[0] == "changeView" and isinstance(item[1], list):
-            fresh_html = item[1][1]
-    fresh_block = next((block for block in splitBuildingBlocks(fresh_html or "")
-                        if block["type"] == building["building"]), None)
-    if fresh_block is None:
-        sendToBot(session, "This building is no longer available in the selected position.")
-        return
-    fresh_costs = parseBuildingCosts(fresh_block["html"])
-    city = getCity(session.get(city_url + str(city["id"])))
-    slot = next((b for b in city["position"] if b["position"] == option["position"]), None)
-    if slot is None or slot["building"] != "empty":
-        sendToBot(session, "Construction cancelled: the selected position is no longer empty.")
-        return
-    required = _constructionRequirements(session, city, fresh_costs)
-    if any(have < need for have, need in zip(city["availableResources"], required)):
-        sendToBot(session, "Resources changed; construction cancelled to protect reserved stock. Please retry.")
-        return
-    # build it
-    params = {
-        "action": "BuildNewBuilding",
-        "cityId": city["id"],
-        "position": option["position"],
-        "building": building["buildingId"],
-        "backgroundView": "city",
-        "currentCityId": city["id"],
-        "templateView": "buildingGround",
-        "actionRequest": current_action_request,
-        "ajax": "1",
-    }
-    buildings_response = session.post(params=params, noIndex=True)
-    response_data = json.loads(buildings_response, strict=False)
-    msg = None
-    for item in response_data:
-        if item[0] == 'provideFeedback':
-            for feedback in item[1]:
-                if feedback.get('text'):
-                    msg = feedback['text']
+    with activity(session):
+        # Refresh the selected slot, costs and action token after transport waits.
+        response = json.loads(session.post(params={
+            "view": "buildingGround", "cityId": city["id"],
+            "position": option["position"], "backgroundView": "city",
+            "currentCityId": city["id"], "actionRequest": current_action_request,
+            "ajax": "1",
+        }, noIndex=True), strict=False)
+        fresh_html = None
+        for item in response:
+            if item[0] == "updateGlobalData":
+                current_action_request = item[1].get("actionRequest", current_action_request)
+            elif item[0] == "changeView" and isinstance(item[1], list):
+                fresh_html = item[1][1]
+        fresh_block = next((block for block in splitBuildingBlocks(fresh_html or "")
+                            if block["type"] == building["building"]), None)
+        if fresh_block is None:
+            sendToBot(session, "This building is no longer available in the selected position.")
+            return
+        fresh_costs = parseBuildingCosts(fresh_block["html"])
+        city = getCity(session.get(city_url + str(city["id"])))
+        slot = next((b for b in city["position"] if b["position"] == option["position"]), None)
+        if slot is None or slot["building"] != "empty":
+            sendToBot(session, "Construction cancelled: the selected position is no longer empty.")
+            return
+        required = _constructionRequirements(session, city, fresh_costs)
+        if any(have < need for have, need in zip(city["availableResources"], required)):
+            sendToBot(session, "Resources changed; construction cancelled to protect reserved stock. Please retry.")
+            return
+        # build it
+        params = {
+            "action": "BuildNewBuilding",
+            "cityId": city["id"],
+            "position": option["position"],
+            "building": building["buildingId"],
+            "backgroundView": "city",
+            "currentCityId": city["id"],
+            "templateView": "buildingGround",
+            "actionRequest": current_action_request,
+            "ajax": "1",
+        }
+        buildings_response = session.post(params=params, noIndex=True)
+        response_data = json.loads(buildings_response, strict=False)
+        msg = None
+        for item in response_data:
+            if item[0] == 'provideFeedback':
+                for feedback in item[1]:
+                    if feedback.get('text'):
+                        msg = feedback['text']
+                        break
+                if msg:
                     break
-            if msg:
-                break
-    if not msg:
-        msg = f"Construction request sent for {building['name']} in city {city['id']}."
-    sendToBot(session, msg)
+        if not msg:
+            msg = f"Construction request sent for {building['name']} in city {city['id']}."
+        sendToBot(session, msg)
