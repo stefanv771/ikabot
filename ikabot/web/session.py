@@ -38,6 +38,7 @@ from ikabot.helpers.pedirInfo import read
 from ikabot.helpers.varios import getDateTime, lastloginTimetoString
 from ikabot.helpers.apiComm import getNewBlackBoxToken
 from ikabot.helpers.lobbyDecaptcha import break_interactive_captcha
+from ikabot.helpers.activityCoordinator import coordinated_request, operation_active
 
 
 class Session:
@@ -1334,6 +1335,7 @@ class Session:
         self.setSessionData(sessionData)
         return token
 
+    @coordinated_request
     def get(
         self, url='', params={}, ignoreExpire=False, noIndex=False, fullResponse=False, noQuery=False, **kwargs
     ):
@@ -1422,6 +1424,8 @@ class Session:
                         return response if fullResponse else html
 
                 if self.__test_server_maintenace(html):
+                    if operation_active():
+                        raise RuntimeError("World maintenance: coordinated action stopped; retry after maintenance.")
                     self.logger.warning("Ikariam world backup is in progress, waiting 10 mins.")
                     time.sleep(10 * 60)
                     raise requests.exceptions.ConnectionError  # repeat after 10 minutes
@@ -1447,12 +1451,19 @@ class Session:
             except AssertionError:
                 self.__sessionExpired()
             except requests.exceptions.ConnectionError:
+                # Do not hold the action gate through network backoff or replay an ambiguous action.
+                if operation_active():
+                    raise
                 self.logger.warning(f"Connection error occured, retrying in {ConnectionError_wait}s\n{str(params) + ' --> ' + url}")
                 time.sleep(ConnectionError_wait)
             except requests.exceptions.Timeout:
+                # Do not hold the action gate through network backoff or replay an ambiguous action.
+                if operation_active():
+                    raise
                 self.logger.warning(f"5 minute timeout occured on request, retrying in {ConnectionError_wait}s\n{str(params) + ' --> ' + url}")
                 time.sleep(ConnectionError_wait)
 
+    @coordinated_request
     def post(
         self, url='', payloadPost={}, params={}, ignoreExpire=False, noIndex=False, fullResponse = False, noQuery=False, **kwargs
     ):
@@ -1555,6 +1566,8 @@ class Session:
                         return response if fullResponse else resp
 
                 if self.__test_server_maintenace(resp):
+                    if operation_active():
+                        raise RuntimeError("World maintenance: coordinated action stopped; retry after maintenance.")
                     self.logger.warning("Ikariam world backup is in progress, waiting 10 mins.")
                     time.sleep(10 * 60)
                     raise requests.exceptions.ConnectionError  # repeat after 10 minutes
@@ -1604,9 +1617,15 @@ class Session:
             except AssertionError:
                 self.__sessionExpired()
             except requests.exceptions.ConnectionError:
+                # Do not hold the action gate through network backoff or replay an ambiguous action.
+                if operation_active():
+                    raise
                 self.logger.warning(f"Connection error occured, retrying in {ConnectionError_wait}s\n{str(params) + ' --> ' + url}")
                 time.sleep(ConnectionError_wait)
             except requests.exceptions.Timeout:
+                # Do not hold the action gate through network backoff or replay an ambiguous action.
+                if operation_active():
+                    raise
                 self.logger.warning(f"5 minute timeout occured on request, retrying in {ConnectionError_wait}s\n{str(params) + ' --> ' + url}")
                 time.sleep(ConnectionError_wait)
 
