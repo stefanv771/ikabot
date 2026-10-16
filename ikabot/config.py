@@ -17,6 +17,11 @@ update_msg = ""
 
 isWindows = os.name == "nt"
 
+# Shared by all cooperating instances under this OS user, including webservers.
+ACTIVITY_COORDINATOR_DIRECTORY = os.getenv("IKABOT_ACTIVITY_DIRECTORY") or os.path.join(os.path.expanduser("~"), ".ikabot", "activity")
+MANUAL_ACTIVITY_IDLE_SECONDS = 60
+ACTIVITY_ACTION_GAP_SECONDS = (10, 30)
+
 # Multiprocessing configuration for pure-Python local decaptcha
 # Set to False if your environment struggles with Python multiprocessing.
 # Leaving this on is safe even with many accounts: the solver sizes itself to
