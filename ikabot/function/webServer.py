@@ -26,6 +26,15 @@ from ikabot.helpers.gui import *
 from ikabot.helpers.pedirInfo import *
 from ikabot.helpers.process import run, set_child_mode, updateProcessList
 from ikabot.helpers.varios import wait
+from ikabot.helpers.activityCoordinator import foreground_requests, ActivityTimeout
+
+
+def proxyGameRequest(session, method, url, params):
+    """Foreground tagging stays local to this request, never on shared Session."""
+    with foreground_requests():
+        request_func = session.post if method == "POST" else session.get
+        return request_func(url, params=params, noIndex=True, fullResponse=True,
+                            noQuery=True, allow_redirects=False)
 
 
 class ResponseTypes:
@@ -189,24 +198,16 @@ def do_webServer(session, port, local_network_ip):
                     new_data[arg] = "version"
                 if arg == "activeTab" and new_data[arg] == "tab_ikabotSandbox":
                     new_data[arg] = "tab_version"
-            if request.method in ["POST"]:
-                resp = session.post(
-                    dest_url,
-                    params=new_data,
-                    noIndex=True,
-                    fullResponse=True,
-                    noQuery=True,
-                    allow_redirects=False,
-                )
-            else:
-                resp = session.get(
-                    dest_url,
-                    params=new_data,
-                    noIndex=True,
-                    fullResponse=True,
-                    noQuery=True,
-                    allow_redirects=False,
-                )
+            try:
+                resp = proxyGameRequest(session, request.method, dest_url, new_data)
+            except ActivityTimeout:
+                return Response(mayorMessageResponse(ResponseTypes.WARNING,
+                    "Another action is still running. Your action was not sent; please retry."),
+                    status=200, mimetype="application/json")
+            except requests.exceptions.RequestException:
+                return Response(mayorMessageResponse(ResponseTypes.WARNING,
+                    "Connection lost. The action result is unknown; refresh the game before retrying."),
+                    status=200, mimetype="application/json")
 
             if is_image:
                 # cache was missed, add to cache and send response
