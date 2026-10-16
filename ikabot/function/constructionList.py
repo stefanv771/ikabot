@@ -28,28 +28,14 @@ from ikabot.helpers.signals import setInfoSignal
 from ikabot.helpers.varios import *
 from ikabot.web.session import normal_get
 from ikabot.helpers.decorators import configurator, task
-from ikabot.function.tavernManager import TavernManager
+from ikabot.helpers.activityCoordinator import activity
+from ikabot.helpers.wineReserve import getWineReserve, WINE_INDEX, WINE_RESERVE, WINE_RESERVE_HOURS
 
 
-WINE_INDEX = 1
-WINE_RESERVE = 10000
-WINE_RESERVE_HOURS = 24
 # Planning margin only; the live check remains authoritative after transports.
 WINE_TRANSPORT_BUFFER_HOURS = 1
 
 
-def getWineReserve(session, city, waiting_seconds=0):
-    consumption = Decimal(str(city.get("wineConsumptionPerHour", 0)))
-    tavern = next((b for b in city["position"] if b["building"] == "tavern"), None)
-    if consumption <= 0 and tavern is not None:
-        data = TavernManager(session)._get_tavern_data(city, tavern, force_refresh=True)
-        if not data or not data["consumption_values"]:
-            raise ValueError("Cannot determine maximum tavern consumption; wine spending blocked.")
-        # A depleted city may shortly resume serving at 100%.
-        consumption = Decimal(max(wine for level, wine in data["consumption_values"]))
-    consumption = max(Decimal(0), consumption)
-    reserve = max(WINE_RESERVE, math.ceil(consumption * WINE_RESERVE_HOURS))
-    return reserve + math.ceil(consumption * Decimal(str(max(0, waiting_seconds))) / 3600)
 
 
 def getResourcesOverCapacity(city, resourcesNeeded):
@@ -209,14 +195,15 @@ def tryFreeBuildingSpeedup(session, city_id, building):
         return False
 
     wait(random.randint(1, SPEEDUP_RANDOMWAIT)) # random wait
-    # Recheck the current price and target after the delay before activating.
-    response = session.post(params=popup_params)
-    speedup_params = _getFreeSpeedupParams(response, city_id, building["position"])
-    if speedup_params is None:
-        return False
+    with activity(session):
+        # Recheck the current price and target after the delay before activating.
+        response = session.post(params=popup_params)
+        speedup_params = _getFreeSpeedupParams(response, city_id, building["position"])
+        if speedup_params is None:
+            return False
 
-    session.post(params=speedup_params)
-    return True
+        session.post(params=speedup_params)
+        return True
 
 
 def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
@@ -340,22 +327,35 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
         city = _waitForWineReserve(session, city, building, waitForResources)
         if city is None:
             return
-        building = city["position"][position]
-        if not building["canUpgrade"]:
-            sendToBot(session, f"{city['cityName']}: construction stopped; resources changed while waiting for wine.")
+        expected_level = city["position"][position]["level"]
+        if expected_level >= upgradeTo:
+            sendToBot(session, f"{city['cityName']}: target level already reached; no additional upgrade sent.")
             return
-        url = "action=UpgradeExistingBuilding&actionRequest={}&cityId={}&position={:d}&level={}&activeTab=tabSendTransporter&backgroundView=city&currentCityId={}&templateView={}&ajax=1".format(
-            actionRequest,
-            cityId,
-            position,
-            building["level"],
-            cityId,
-            building["building"],
-        )
-        resp = session.post(url)
-        html = session.get(city_url + cityId)
-        city = getCity(html)
-        building = city["position"][position]
+        with activity(session):
+            city = getCity(session.get(city_url + str(cityId)))
+            building = city["position"][position]
+            if building["isBusy"] or building["level"] != expected_level:
+                sendToBot(session, f"{city['cityName']}: construction changed while waiting; please requeue the upgrade.")
+                return
+            city = _waitForWineReserve(session, city, building, False)
+            if city is None:
+                return
+            building = city["position"][position]
+            if not building["canUpgrade"]:
+                sendToBot(session, f"{city['cityName']}: construction stopped; resources changed while waiting for wine.")
+                return
+            url = "action=UpgradeExistingBuilding&actionRequest={}&cityId={}&position={:d}&level={}&activeTab=tabSendTransporter&backgroundView=city&currentCityId={}&templateView={}&ajax=1".format(
+                actionRequest,
+                cityId,
+                position,
+                building["level"],
+                cityId,
+                building["building"],
+            )
+            resp = session.post(url)
+            html = session.get(city_url + cityId)
+            city = getCity(html)
+            building = city["position"][position]
         if building["isBusy"] is False:
             msg = "{}: The building {} was not extended".format(
                 city["cityName"], building["name"]
