@@ -14,6 +14,8 @@ from ikabot.helpers.process import set_child_mode
 from ikabot.helpers.signals import setInfoSignal
 from ikabot.helpers.varios import *
 
+from ikabot.helpers.activityCoordinator import activity
+
 SATISFACTION_BUFFER = 5
 
 
@@ -90,20 +92,27 @@ class TavernManager:
         return next((w for l, w in consumption_values if l == level), 0)
 
     def _apply_level(self, city, tavern, target_level, tavern_data):
-        params = {
-            'action': 'CityScreen',
-            'function': 'assignWinePerTick',
-            'cityId': city['id'],
-            'position': tavern['position'],
-            'amount': target_level,
-            'backgroundView': 'city',
-            'currentCityId': city['id'],
-            'templateView': 'tavern',
-            'actionRequest': tavern_data['action_code'],
-            'ajax': '1',
-        }
-        self.session.post(params=params)
-        self._cache.pop(city['id'], None)
+        with activity(self.session):
+            fresh = self._get_tavern_data(city, tavern, force_refresh=True)
+            if not fresh or not fresh["action_code"] or not fresh["consumption_values"]:
+                raise ValueError("Cannot refresh tavern before changing serving level.")
+            if target_level > max(level for level, wine in fresh["consumption_values"]):
+                raise ValueError("Tavern capacity changed while waiting; please retry.")
+            tavern_data = fresh
+            params = {
+                'action': 'CityScreen',
+                'function': 'assignWinePerTick',
+                'cityId': city['id'],
+                'position': tavern['position'],
+                'amount': target_level,
+                'backgroundView': 'city',
+                'currentCityId': city['id'],
+                'templateView': 'tavern',
+                'actionRequest': tavern_data['action_code'],
+                'ajax': '1',
+            }
+            self.session.post(params=params)
+            self._cache.pop(city['id'], None)
 
     def _get_town_hall_data(self, city_id, city_data):
         town_hall_position = next(
