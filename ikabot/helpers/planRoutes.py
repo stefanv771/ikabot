@@ -13,6 +13,9 @@ from ikabot.helpers.getJson import getCity
 from ikabot.helpers.naval import *
 from ikabot.helpers.varios import wait
 from ikabot.helpers.pedirInfo import getShipCapacity
+from ikabot.helpers.wineReserve import getWineReserve, WINE_INDEX
+from ikabot.helpers.botComm import sendToBot
+from ikabot.helpers.activityCoordinator import activity
 
 
 def sendGoods(session, originCityId, destinationCityId, islandId, ships, send, useFreighters=False):
@@ -32,69 +35,81 @@ def sendGoods(session, originCityId, destinationCityId, islandId, ships, send, u
     send : list
         array of resources to send
     """
+    send = list(send)
     # this can fail if a random request is made in between this two posts
     while True:
-        html = session.get()
-        current_city = getCity(html)  # the city the bot is right now
-        city = getCity(session.get(city_url + originCityId))  # the origin city
-        currId = current_city["id"]
+        with activity(session):
+            html = session.get()
+            current_city = getCity(html)  # the city the bot is right now
+            city = getCity(session.get(city_url + originCityId))  # the origin city
+            for i, requested in enumerate(send):
+                if i != WINE_INDEX:
+                    send[i] = min(requested, city["availableResources"][i])
+            if send[WINE_INDEX] > 0:
+                surplus = max(0, city["availableResources"][WINE_INDEX] - getWineReserve(session, city))
+                if send[WINE_INDEX] > surplus:
+                    sendToBot(session, f"Wine transport from {city['name']} reduced to {surplus:,} to protect the city's reserve.")
+                    send[WINE_INDEX] = surplus
+            if not any(send):
+                return send
+            currId = current_city["id"]
 
-        # Change from the city the bot is sitting right now to the city we want to load resources from
-        data = {
-            "action": "header",
-            "function": "changeCurrentCity",
-            "actionRequest": actionRequest,
-            "oldView": "city",
-            "cityId": originCityId,
-            "backgroundView": "city",
-            "currentCityId": currId,
-            "ajax": "1",
-        }
+            # Change from the city the bot is sitting right now to the city we want to load resources from
+            data = {
+                "action": "header",
+                "function": "changeCurrentCity",
+                "actionRequest": actionRequest,
+                "oldView": "city",
+                "cityId": originCityId,
+                "backgroundView": "city",
+                "currentCityId": currId,
+                "ajax": "1",
+            }
 
-        session.post(params=data)
+            session.post(params=data)
 
-        # Request to send the resources from the origin to the target
-        data = {
-            "action": "transportOperations",
-            "function": "loadTransportersWithFreight",
-            "destinationCityId": destinationCityId,
-            "islandId": islandId,
-            "oldView": "",
-            "position": "",
-            "avatar2Name": "",
-            "city2Name": "",
-            "type": "",
-            "activeTab": "",
-            "transportDisplayPrice": "0",
-            "premiumTransporter": "0",
-            "capacity": "5",
-            "max_capacity": "5",
-            "jetPropulsion": "0",
-            "backgroundView": "city",
-            "currentCityId": originCityId,
-            "templateView": "transport",
-            "currentTab": "tabSendTransporter",
-            "actionRequest": actionRequest,
-            "ajax": "1",
-        }
+            # Request to send the resources from the origin to the target
+            data = {
+                "action": "transportOperations",
+                "function": "loadTransportersWithFreight",
+                "destinationCityId": destinationCityId,
+                "islandId": islandId,
+                "oldView": "",
+                "position": "",
+                "avatar2Name": "",
+                "city2Name": "",
+                "type": "",
+                "activeTab": "",
+                "transportDisplayPrice": "0",
+                "premiumTransporter": "0",
+                "capacity": "5",
+                "max_capacity": "5",
+                "jetPropulsion": "0",
+                "backgroundView": "city",
+                "currentCityId": originCityId,
+                "templateView": "transport",
+                "currentTab": "tabSendTransporter",
+                "actionRequest": actionRequest,
+                "ajax": "1",
+            }
         
-        if useFreighters is False:
-            shiptype = "transporters"
-            data[shiptype] = ships
-        else:
-            shiptype = "usedFreightersShips"
-            data[shiptype] = ships
-            data["transporters"] = "0"
-        # add amounts of resources to send
-        for i in range(len(send)):
-            if city["availableResources"][i] > 0:
-                key = "cargo_resource" if i == 0 else "cargo_tradegood{:d}".format(i)
-                data[key] = send[i]
+            if useFreighters is False:
+                shiptype = "transporters"
+                data[shiptype] = ships
+            else:
+                shiptype = "usedFreightersShips"
+                data[shiptype] = ships
+                data["transporters"] = "0"
+            # add amounts of resources to send
+            for i in range(len(send)):
+                if city["availableResources"][i] > 0:
+                    key = "cargo_resource" if i == 0 else "cargo_tradegood{:d}".format(i)
+                    data[key] = send[i]
 
-        resp = session.post(params=data)
-        resp = json.loads(resp, strict=False)
+            resp = session.post(params=data)
+            resp = json.loads(resp, strict=False)
         if resp[3][1][0]["type"] == 10:
-            break
+            return send
         elif resp[3][1][0]["type"] == 11:
             wait(getMinimumWaitingTime(session))
         time.sleep(5)
@@ -128,6 +143,13 @@ def executeRoutes(session, routes, useFreighters=False):
             origin_city = getCity(html)
             html = session.get(city_url + str(destination_city_id))
             destination_city = getCity(html)
+            if toSend[WINE_INDEX] > 0:
+                surplus = max(0, origin_city["availableResources"][WINE_INDEX] - getWineReserve(session, origin_city))
+                if toSend[WINE_INDEX] > surplus:
+                    sendToBot(session, f"Wine transport from {origin_city['name']} limited to {surplus:,}; reserved wine will remain in the city.")
+                    toSend[WINE_INDEX] = surplus
+                if not any(toSend):
+                    break
             foreign = str(destination_city["id"]) != str(destination_city_id)
             if foreign is False:
                 storageCapacityInCity = destination_city["freeSpaceForResources"]
@@ -149,7 +171,6 @@ def executeRoutes(session, routes, useFreighters=False):
                     )
                 send.append(min_val)
                 storageCapacityInShips -= send[i]
-                toSend[i] -= send[i]
 
             resources_to_send = sum(send)
             if resources_to_send == 0:
@@ -166,7 +187,7 @@ def executeRoutes(session, routes, useFreighters=False):
                 available_ships = int(
                     math.ceil((Decimal(resources_to_send) / Decimal(freighter_capacity)))
                 )
-            sendGoods(
+            sent = sendGoods(
                 session,
                 origin_city["id"],
                 destination_city_id,
@@ -175,6 +196,12 @@ def executeRoutes(session, routes, useFreighters=False):
                 send,
                 useFreighters,
             )
+            # The final check may reduce wine again if stock changed while preparing.
+            for i, amount in enumerate(sent):
+                toSend[i] -= amount
+                if amount < send[i]:
+                    toSend[i] = 0
+                    sendToBot(session, f"Transport from {origin_city['name']} reduced: resource {i} changed before dispatch. Unavailable remainder cancelled.")
             time.sleep(random.randint(60, 300))
 
 
