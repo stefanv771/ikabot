@@ -127,9 +127,14 @@ class ActivityCoordinator:
             return abs(psutil.Process(pid).create_time() - born) < 0.01
         except psutil.NoSuchProcess:
             return False
-        except psutil.AccessDenied:
-            # Inability to inspect an owner is not evidence that it died.
-            return True
+        except (psutil.AccessDenied, PermissionError, Exception):
+            # Fallback pentru Termux/Android unde /proc/stat este blocat de SELinux.
+            # Verificam daca procesul inca ruleaza folosind apelul nativ POSIX kill 0.
+            try:
+                os.kill(pid, 0)
+                return True
+            except OSError:
+                return False
 
     def _prune(self, db, now):
         for ticket, pid, born, expires in db.execute("SELECT ticket, pid, born, expires FROM tickets").fetchall():
@@ -143,7 +148,13 @@ class ActivityCoordinator:
             return
         ticket = uuid.uuid4().hex
         now = time.time()
-        born = psutil.Process().create_time()
+        
+        # Protectie pentru Termux: evitam AccessDenied cand citim timpul de pornire
+        try:
+            born = psutil.Process().create_time()
+        except (psutil.AccessDenied, PermissionError, Exception):
+            born = 0.0
+
         mutex = _FileMutex(self.directory / "action.lock")
         entered = False
         token = None
