@@ -30,6 +30,7 @@ from ikabot.helpers.sessionStorage import (
     get_user_file_path,
     get_users_dir,
     find_user_file_for_email,
+    session_data_lock,
 )
 from ikabot.helpers.botComm import *
 from ikabot.helpers.getJson import getCity
@@ -39,6 +40,10 @@ from ikabot.helpers.varios import getDateTime, lastloginTimetoString
 from ikabot.helpers.apiComm import getNewBlackBoxToken
 from ikabot.helpers.lobbyDecaptcha import break_interactive_captcha
 from ikabot.helpers.activityCoordinator import coordinated_request, operation_active
+
+
+class IkariamErrorPage(Exception):
+    """Ikariam returned an error page, but the session is not known to be expired"""
 
 
 class Session:
@@ -67,17 +72,21 @@ class Session:
         """
         self.logger.info(f"Changing status to {message}")
 
-        # read from file
-        sessionData = self.getSessionData()
-        try:
-            fileList = sessionData["processList"]
-        except KeyError:
-            fileList = []
-        # modify current process' status message
-        [p.update({"status": message}) for p in fileList if p["pid"] == os.getpid()]
-        # dump back to session data
-        sessionData["processList"] = fileList
-        self.setSessionData(sessionData)
+        self.updateProcessEntry(os.getpid(), status=message)
+
+    def updateProcessEntry(self, pid, **fields):
+        """Updates fields (status, action, ...) of one row of the main menu process list
+        Parameters
+        ----------
+        pid : int
+            pid of the process whose row is modified
+        """
+        with session_data_lock():
+            sessionData = self.getSessionData()
+            fileList = sessionData.get("processList", [])
+            [p.update(fields) for p in fileList if p["pid"] == pid]
+            sessionData["processList"] = fileList
+            self.setSessionData(sessionData, keep_process_list=False)
 
     def __genRand(self):
         return hex(random.randint(0, 65535))[2:]
@@ -129,7 +138,7 @@ class Session:
         if not isinstance(html, str):
             return False
         if re.search(
-            r'"reload"\s*,\s*\{\s*"link"\s*:\s*"https://lobby\.ikariam\.gameforge\.com',
+            r'"reload"\s*,\s*\{\s*"link"\s*:\s*"https:\\?/\\?/lobby\.ikariam\.gameforge\.com',
             html,
         ):
             return True
@@ -1240,6 +1249,36 @@ class Session:
         if self.padre is False:
             time.sleep(5 * random.randint(0, 10))
 
+    def __isSessionAlive(self):
+        """Checks with a light request whether the session is still valid. Some error
+        pages look like an expired session, and logging in again would invalidate the
+        session of every other running task
+        Returns
+        -------
+        alive : bool or None
+            None if it could not be determined
+        """
+        try:
+            response = self.s.get(
+                self.urlBase + "view=updateGlobalData&ajax=1",
+                verify=config.do_ssl_verify,
+                timeout=60,
+                allow_redirects=False,
+            )
+        except requests.exceptions.RequestException:
+            return None
+        # an expired session gets a redirect or a reload command to the lobby
+        location = response.headers.get("Location", "")
+        if (urllib.parse.urlsplit(location).hostname or "") == "lobby.ikariam.gameforge.com":
+            return False
+        if self.__isSessionRotated(response.text, response=response):
+            return False
+        try:
+            alive = response.status_code == 200 and json.loads(response.text)[0][0] == "updateGlobalData"
+        except (ValueError, IndexError, KeyError, TypeError):
+            alive = False
+        return True if alive else None
+
     def __sessionExpired(self):
         self.logger.info("__sessionExpired()")
         self.__backoff()
@@ -1330,6 +1369,8 @@ class Session:
             self.__printSessionRotated()
             sys.exit(1)
         token = match.group(1)
+        # self.get() may have logged in again, don't write back the old cookies
+        sessionData = self.getSessionData()
         sessionData.pop("shared", None)
         sessionData["actionRequestToken"] = token
         self.setSessionData(sessionData)
@@ -1347,7 +1388,7 @@ class Session:
         params : dict
             dictionary containing key-value pairs which represent the parameteres of the get request
         ignoreExpire: bool
-            if set to True it will ignore if the current session is expired and will simply return whatever response it gets. If it's set to False, it will make sure that the current session is not expired before sending the get request, if it's expired it will login again
+            if set to True it will ignore if the current session is expired and will simply return whatever response it gets. If it's set to False, it will make sure that the current session is not expired before sending the get request, if it's expired it will login again. If the page only looks expired and the session is not known to be expired, the request is retried once and then IkariamErrorPage is raised
         noIndex : bool
             if set to True it will remove 'index.php' from the end of urlBase before appending url params and sending the get request
         fullResponse : bool
@@ -1367,6 +1408,7 @@ class Session:
             url = self.urlBase + url
         if noQuery:
             url = url.replace('?','')
+        error_page_retried = False
         while True:
             try:
                 self.requestHistory.append(
@@ -1429,6 +1471,13 @@ class Session:
                     self.logger.warning("Ikariam world backup is in progress, waiting 10 mins.")
                     time.sleep(10 * 60)
                     raise requests.exceptions.ConnectionError  # repeat after 10 minutes
+                if ignoreExpire is False and self.__isExpired(html) and self.__isSessionAlive() is not False:
+                    if error_page_retried:
+                        raise IkariamErrorPage(url)
+                    self.logger.warning(f"Ikariam returned an error page, retrying: {url}")
+                    error_page_retried = True
+                    time.sleep(5)
+                    continue
                 if ignoreExpire is False:
                     assert self.__isExpired(html) is False
                 if self.__isSessionRotated(html, response=response):
@@ -1477,7 +1526,7 @@ class Session:
         params : dict
             dictionary containing key-value pairs which represent the parameteres of the post request
         ignoreExpire: bool
-            if set to True it will ignore if the current session is expired and will simply return whatever response it gets. If it's set to False, it will make sure that the current session is not expired before sending the post request, if it's expired it will login again
+            if set to True it will ignore if the current session is expired and will simply return whatever response it gets. If it's set to False, it will make sure that the current session is not expired before sending the post request, if it's expired it will login again. If the page only looks expired and the session is not known to be expired, IkariamErrorPage is raised without sending the request again
         noIndex : bool
             if set to True it will remove 'index.php' from the end of urlBase before appending url and params and sending the post request
 
@@ -1571,6 +1620,13 @@ class Session:
                     self.logger.warning("Ikariam world backup is in progress, waiting 10 mins.")
                     time.sleep(10 * 60)
                     raise requests.exceptions.ConnectionError  # repeat after 10 minutes
+                if ignoreExpire is False and self.__isExpired(resp) and self.__isSessionAlive() is not False:
+                    # not sent again, it may be an action, which may also have used up the token
+                    sessionData = self.getSessionData()
+                    if sessionData.pop("actionRequestToken", None) is not None:
+                        sessionData.pop("shared", None)
+                        self.setSessionData(sessionData)
+                    raise IkariamErrorPage(url)
                 if ignoreExpire is False:
                     assert self.__isExpired(resp) is False
                 if self.__isSessionRotated(resp, response=response):
@@ -1635,7 +1691,7 @@ class Session:
         if self.padre is False:
             os._exit(0)
 
-    def setSessionData(self, sessionData, shared=False):
+    def setSessionData(self, sessionData, shared=False, keep_process_list=True):
         """Writes relevant session data to disk formatted as JSON (indent=2)
         Parameters
         ----------
@@ -1643,8 +1699,11 @@ class Session:
             dictionary containing relevant session data
         shared : bool
             Indicates if the new data should be shared among all accounts associated with the user-password
+        keep_process_list : bool
+            If True (default), keeps the process list already stored on disk. Only pass False, inside
+            session_data_lock(), to modify the list on purpose (see updateProcessEntry)
         """
-        set_session_data(self, sessionData, shared=shared)
+        set_session_data(self, sessionData, shared=shared, keep_process_list=keep_process_list)
 
     def getSessionData(self):
         """Gets fresh session data from disk (hot-reloaded)"""
