@@ -1,7 +1,6 @@
 #! /usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-
 import hashlib
 import html
 import json
@@ -31,11 +30,8 @@ from ikabot.helpers.decorators import configurator, task
 from ikabot.helpers.activityCoordinator import activity
 from ikabot.helpers.wineReserve import getWineReserve, WINE_INDEX, WINE_RESERVE, WINE_RESERVE_HOURS
 
-
 # Planning margin only; the live check remains authoritative after transports.
 WINE_TRANSPORT_BUFFER_HOURS = 1
-
-
 
 
 def getResourcesOverCapacity(city, resourcesNeeded):
@@ -43,9 +39,11 @@ def getResourcesOverCapacity(city, resourcesNeeded):
     if capacity is None:
         return []
     listed = city.get("resourcesListedForSale", [0] * len(materials_names))
-    return [(materials_names[i], needed, max(0, capacity - listed[i]))
-            for i, needed in enumerate(resourcesNeeded)
-            if needed > max(0, capacity - listed[i])]
+    return [
+        (materials_names[i], needed, max(0, capacity - listed[i]))
+        for i, needed in enumerate(resourcesNeeded)
+        if needed > max(0, capacity - listed[i])
+    ]
 
 
 def _constructionRequirements(session, city, costs, waiting_seconds=0):
@@ -56,28 +54,59 @@ def _constructionRequirements(session, city, costs, waiting_seconds=0):
 
 
 def _waitForWineReserve(session, city, building, wait_for_resources):
-    """Re-read live costs and stock for each level; never spend the reserve."""
+    """
+    Asigura ca avem resursele pentru constructie. Daca cladirea cere vin (ex: Palat),
+    asteapta transporturile daca sunt pe drum, dar daca transporturile au sosit si avem
+    vinul necesar pentru costul cladirii, permite upgrade-ul chiar daca taverna a consumat
+    o parte din rezerva in timpul transportului.
+    """
     notified = False
     while True:
         costs = getResourcesNeeded(session, city, dict(building), building["level"], building["level"] + 1)
         if any(cost < 0 for cost in costs):
             return None
-        required = _constructionRequirements(session, city, costs)
-        over_capacity = getResourcesOverCapacity(city, required)
-        if over_capacity:
-            sendToBot(session, f"{city['cityName']}: construction paused. Insufficient storage (cost plus wine reserve): {over_capacity}. Upgrade storage first.")
-            return None
-        if costs[WINE_INDEX] == 0 or city["availableResources"][WINE_INDEX] >= required[WINE_INDEX]:
+
+        wine_cost = costs[WINE_INDEX]
+        wine_available = city["availableResources"][WINE_INDEX]
+
+        # Daca cladirea nu consuma vin, putem continua direct
+        if wine_cost == 0:
             return city
+
+        wine_reserve = getWineReserve(session, city, 0)
+        full_required = wine_cost + wine_reserve
+
+        # Cazul ideal: avem vin pentru constructie SI toata rezerva intacta
+        if wine_available >= full_required:
+            return city
+
+        # Daca avem destul vin pentru costul cladirii
+        if wine_available >= wine_cost:
+            seconds = getMinimumWaitingTime(session) if wait_for_resources else 0
+            # Daca inca mai vin nave pe drum, asteptam sa soseasca tot vinul
+            if seconds > 0:
+                wait(seconds + 5)
+                city = getCity(session.get(city_url + str(city["id"])))
+                building = city["position"][building["position"]]
+                continue
+            else:
+                # Toate navele au sosit; chiar daca taverna a baut o parte din rezerva,
+                # avem vinul pentru cladire -> CONSTRUIM!
+                return city
+
+        # Daca NU avem destul vin nici macar pentru costul de constructie:
         if not notified:
-            sendToBot(session, f"{city['cityName']}: construction paused to protect wine. Need {required[WINE_INDEX]:,}, have {city['availableResources'][WINE_INDEX]:,}.")
+            sendToBot(session, f"{city['cityName']}: construction paused. Need {wine_cost:,} wine for {building['name']}, have {wine_available:,}.")
             notified = True
+
         if not wait_for_resources:
             return None
+
         seconds = getMinimumWaitingTime(session)
         if seconds <= 0:
-            sendToBot(session, f"{city['cityName']}: no transport detected; construction stopped without spending the wine reserve.")
+            sendToBot(session, f"{city['cityName']}: no transport detected; construction of {building['name']} stopped due to insufficient wine.")
             return None
+
         wait(seconds + 5)
         city = getCity(session.get(city_url + str(city["id"])))
         building = city["position"][building["position"]]
@@ -194,9 +223,8 @@ def tryFreeBuildingSpeedup(session, city_id, building):
     if speedup_params is None:
         return False
 
-    wait(random.randint(1, SPEEDUP_RANDOMWAIT)) # random wait
+    wait(random.randint(1, SPEEDUP_RANDOMWAIT))
     with activity(session):
-        # Recheck the current price and target after the delay before activating.
         response = session.post(params=popup_params)
         speedup_params = _getFreeSpeedupParams(response, city_id, building["position"])
         if speedup_params is None:
@@ -207,20 +235,8 @@ def tryFreeBuildingSpeedup(session, city_id, building):
 
 
 def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    city_id : int
-    final_lvl : int
-
-    Returns
-    -------
-    city : dict
-    """
     observed_construction = False
     while True:
-
         html = session.get(city_url + city_id)
         city = getCity(html)
 
@@ -282,23 +298,13 @@ def waitForConstruction(session, city_id, final_lvl, construction_queue=None):
 
 
 def expandBuilding(session, cityId, building, waitForResources, construction_queue=None):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    cityId : int
-    building : dict
-    waitForResources : bool
-    """
     current_level = building["level"]
     if building["isBusy"]:
         current_level += 1
     levels_to_upgrade = building["upgradeTo"] - current_level
     position = building["position"]
     upgradeTo = building["upgradeTo"]
-    time.sleep(
-        random.randint(5, 15)
-    )  # to avoid race conditions with sendResourcesNeeded
+    time.sleep(random.randint(5, 15))
 
     for lv in range(levels_to_upgrade):
         city = waitForConstruction(session, cityId, upgradeTo, construction_queue)
@@ -311,7 +317,6 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
                 html = session.get(city_url + cityId)
                 city = getCity(html)
                 building = city["position"][position]
-                # if no ships are comming, exit no matter if the building can or can't upgrade
                 if seconds == 0:
                     break
                 wait(seconds + 5)
@@ -331,19 +336,23 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
         if expected_level >= upgradeTo:
             sendToBot(session, f"{city['cityName']}: target level already reached; no additional upgrade sent.")
             return
+
         with activity(session):
             city = getCity(session.get(city_url + str(cityId)))
             building = city["position"][position]
             if building["isBusy"] or building["level"] != expected_level:
                 sendToBot(session, f"{city['cityName']}: construction changed while waiting; please requeue the upgrade.")
                 return
+
             city = _waitForWineReserve(session, city, building, False)
             if city is None:
                 return
+
             building = city["position"][position]
             if not building["canUpgrade"]:
-                sendToBot(session, f"{city['cityName']}: construction stopped; resources changed while waiting for wine.")
+                sendToBot(session, f"{city['cityName']}: construction stopped; resources changed before upgrade.")
                 return
+
             url = "action=UpgradeExistingBuilding&actionRequest={}&cityId={}&position={:d}&level={}&activeTab=tabSendTransporter&backgroundView=city&currentCityId={}&templateView={}&ajax=1".format(
                 actionRequest,
                 cityId,
@@ -356,6 +365,7 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
             html = session.get(city_url + cityId)
             city = getCity(html)
             building = city["position"][position]
+
         if building["isBusy"] is False:
             msg = "{}: The building {} was not extended".format(
                 city["cityName"], building["name"]
@@ -380,15 +390,6 @@ def expandBuilding(session, cityId, building, waitForResources, construction_que
 
 
 def getCostsReducers(city):
-    """
-    Parameters
-    ----------
-    city : dict
-
-    Returns
-    -------
-    reducers_per_material_level : dict[int, int]
-    """
     reducers_per_material = [0] * len(materials_names)
     assert len(reducers_per_material) == 5
 
@@ -410,21 +411,6 @@ def getCostsReducers(city):
 
 
 def getResourcesNeeded(session, city, building, current_level, final_level, simulated_reducers=None):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    city : dict
-    building : dict
-    current_level : int
-    final_level : int
-    simulated_reducers : list[int]
-
-    Returns
-    -------
-    costs_per_material : dict[int, int]
-    """
-    # get html with information about buildings
     building_detail_url = "view=buildingDetail&buildingId=0&helpId=1&backgroundView=city&currentCityId={}&templateView=ikipedia&actionRequest={}&ajax=1".format(
         city["id"], actionRequest
     )
@@ -432,7 +418,6 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
     building_detail = json.loads(building_detail_response, strict=False)
     building_html = building_detail[1][1][1]
 
-    # get html with information about buildings costs
     regex_building_detail = (
         r'<div class="(?:selected)? button_building '
         + re.escape(building["building"])
@@ -447,12 +432,10 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
     building_costs = json.loads(building_costs_response, strict=False)
     html_costs = building_costs[1][1][1]
 
-    # if the user has all the resource saving studies, we save that in the session data (one less request)
     sessionData = session.getSessionData()
     if "reduccion_inv_max" in sessionData:
         costs_reduction = 14
     else:
-        # get the studies
         url = "view=noViewChange&researchType=economy&backgroundView=city&currentCityId={}&templateView=researchAdvisor&actionRequest={}&ajax=1".format(
             city["id"], actionRequest
         )
@@ -462,7 +445,6 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
         studies = json.loads(studies, strict=False)
         studies = studies["currResearchType"]
 
-        # look for resource saving studies
         costs_reduction = 0
         for study in studies:
             if studies[study]["liClass"] != "explored":
@@ -475,32 +457,26 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
             elif "2100" in link:
                 costs_reduction += 8
 
-        # if the user has all the resource saving studies, save that in the session data
         if costs_reduction == 14:
             sessionData["reduccion_inv_max"] = True
             session.setSessionData(sessionData)
 
-    # calculate cost reductions
     costs_reduction /= 100
     costs_reduction = 1 - costs_reduction
 
-    # get buildings that reduce the cost of upgrades
     if simulated_reducers is None:
         costs_reductions = getCostsReducers(city)
     else:
         costs_reductions = simulated_reducers
 
-    # get the type of resources that this upgrade will cost (wood, marble, etc)
     resources_types = re.findall(
         r'<th class="costs"><img src="(.*?)\.png"/></th>', html_costs
     )[:-1]
 
-    # get the actual cost of each upgrade
     matches = re.findall(
         r'<td class="level">\d+</td>(?:\s+<td class="costs">.*?</td>)+', html_costs
     )
 
-    # calculate the cost of the entire upgrade, taking into account all the possible reductions
     final_costs = [0] * len(materials_names)
     construction_time = 0
     construction_times = []
@@ -517,16 +493,13 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
         levels_to_upgrade += 1
         level_time = _parseConstructionTime(match)
         if level_time is not None:
-            # Keep full durations: optional speedups may be unavailable or rejected.
             construction_time += level_time
             construction_times.append(level_time)
-        # get the costs for the current level
+
         costs = re.findall(r'<td class="costs"><div.*>([\d,\.\s\xa0]*)</div></div></td>', match)
-        # delete blank spaces (\xa0) in costs
         costs = [value.replace('\xa0', '').replace(' ', '') for value in costs]
 
         for i in range(len(costs)):
-            # get hash from CDN images to identify the resource type
             resource_type = checkhash("https:" + resources_types[i] + ".png")
 
             for j in range(len(materials_names_tec)):
@@ -535,24 +508,15 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
                     resource_index = j
                     break
 
-            # get the cost of the current resource type
             cost = costs[i]
             cost = cost.replace(",", "").replace(".", "")
             cost = 0 if cost == "" else int(cost)
 
-            # calculate all the reductions
             investigation_multiplier = Decimal(str(costs_reduction))
             building_reduction = Decimal(costs_reductions[resource_index]) / Decimal(100)
-
-            # Calculate the final multiplier
             final_multiplier = investigation_multiplier - building_reduction
-
-            # Apply the direct proportion without trying to guess the hidden base cost
             real_cost = Decimal(cost) * (final_multiplier / investigation_multiplier)
-
-            # Always round up to ensure we never fall short by 1 unit (prevents wasted transports or failed upgrades)
             final_costs[resource_index] += math.ceil(real_cost)
-
 
         if building["building"] == "carpentering":
             costs_reductions[0] = min(50, costs_reductions[0] + 1)
@@ -574,7 +538,6 @@ def getResourcesNeeded(session, city, building, current_level, final_level, simu
         msg = "Expand {:d} levels? [Y/n]:".format(levels_to_upgrade)
         rta = read(msg=msg, values=["Y", "y", "N", "n", ""])
         if rta.lower() == "n":
-            #Skip only this building
             return [-2, -2, -2, -2, -2]
 
     building["constructionTime"] = construction_time
@@ -592,26 +555,13 @@ def _round_up_resources(amount):
 
 
 def sendResourcesNeeded(session, destination_city_id, city_origins, missing_resources, useFreighters=False, useRounding=False):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    destination_city_id : int
-    city_origins : dict
-    missing_resources : dict[int, int]
-    useFreighters : bool
-    useRounding : bool
-    """
-
     info = "\nTransport resources to upload building\n"
 
     try:
         html = session.get(city_url + destination_city_id)
         cityD = getCity(html)
 
-        # build combined routes per origin city so multiple resources
-        # from the same city are sent in a single shipment
-        combined = {}  # origin_city_id -> (cityOrigin, toSend_list)
+        combined = {}
         refreshed_origins = {}
         room = list(cityD.get("freeSpaceForResources", [max(0, cityD.get("storageCapacity", 0) - amount) for amount in cityD["availableResources"]]))
 
@@ -635,8 +585,11 @@ def sendResourcesNeeded(session, destination_city_id, city_origins, missing_reso
                     refreshed_origins[origin_id] = getCity(session.get(city_url + str(origin_id)))
                 cityOrigin = refreshed_origins[origin_id]
                 available = cityOrigin["availableResources"][i]
+                
+                # Protectia se aplica strict pentru vin!
                 if i == WINE_INDEX:
                     available = max(0, available - getWineReserve(session, cityOrigin))
+
                 send = min(available, remaining)
                 if send <= 0:
                     continue
@@ -649,7 +602,10 @@ def sendResourcesNeeded(session, destination_city_id, city_origins, missing_reso
                 cityOrigin["availableResources"][i] -= send
 
             if remaining > 0:
-                sendToBot(session, f"{cityD['cityName']}: {remaining:,} {materials_names[i]} could not be supplied without using protected stock. Construction will recheck resources before upgrading.")
+                if i == WINE_INDEX:
+                    sendToBot(session, f"{cityD['cityName']}: {remaining:,} wine could not be supplied without dipping into protected wine reserve.")
+                else:
+                    sendToBot(session, f"{cityD['cityName']}: {remaining:,} {materials_names[i]} could not be supplied (insufficient available stock in origin cities).")
 
         routes = []
         for city_id, (cityOrigin, toSend) in combined.items():
@@ -661,20 +617,9 @@ def sendResourcesNeeded(session, destination_city_id, city_origins, missing_reso
     except Exception as e:
         msg = "Error in:\n{}\nCause:\n{}".format(info, traceback.format_exc())
         sendToBot(session, msg)
-        # no s.logout() because this is a thread, not a process
 
 
 def chooseResourceProviders(session, cities_ids, cities, city_id, resource, missing):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    cities_ids : list[int]
-    cities : dict[int, dict]
-    city_id : int
-    resource : int
-    missing : int
-    """
     send_resources_flag = True
     expand_flag = True
 
@@ -696,12 +641,12 @@ def chooseResourceProviders(session, cities_ids, cities, city_id, resource, miss
         city = getCity(html)
 
         available = city["availableResources"][resource]
+        # Protectie aplicata doar la vin
         if resource == WINE_INDEX:
             available = max(0, available - getWineReserve(session, city))
         if available == 0:
             continue
 
-        # ask the user it this city should provide resources
         tradegood_initial = tradegood_initials[int(cities[cityId]["tradegood"])]
         pad = " " * (maxName - len(cities[cityId]["name"]))
         is_producer = (int(cities[cityId]["tradegood"]) == int(resource))
@@ -716,14 +661,11 @@ def chooseResourceProviders(session, cities_ids, cities, city_id, resource, miss
         if choice.lower() == "n":
             continue
 
-        # if so, save the city and calculate the total amount resources to send
         total_available += available
         origin_cities.append(city)
-        # if we have enough resources, return
         if total_available >= missing:
             return origin_cities, send_resources_flag, expand_flag
 
-    # if we reach this part, there are not enough resources to expand the building
     print("\nThere are not enough resources.")
 
     if len(origin_cities) > 0:
@@ -741,20 +683,12 @@ def chooseResourceProviders(session, cities_ids, cities, city_id, resource, miss
 
 
 def sendResourcesMenu(session, city_id, missing):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    city_id : int
-    missing : list[int, int]
-    """
     cities_ids, cities = getIdsOfCities(session)
     origins = {}
     
     send_resources_flag = True
     expand_flag = True
     
-    # for each missing resource, choose providers
     for resource in range(len(missing)):
         if missing[resource] <= 0:
             continue
@@ -783,21 +717,10 @@ def sendResourcesMenu(session, city_id, missing):
 
 
 def getBuildingsToExpand(session, cityId):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    cityId : int
-
-    Returns
-    -------
-    buildings : list of dict
-    """
     html = session.get(city_url + cityId)
     city = getCity(html)
 
     banner()
-    # show the buildings available to expand (ignore empty spaces)
     print("Which buildings do you want to expand? Separate numbers with commas (7, 1, 3, 5, ...)\n")
     print("(0)\t\texit")
     buildings = [
@@ -805,7 +728,6 @@ def getBuildingsToExpand(session, cityId):
     ]
     for i in range(len(buildings)):
         building = buildings[i]
-
         level = building["level"]
 
         if building["isMaxLevel"] is True:
@@ -831,9 +753,7 @@ def getBuildingsToExpand(session, cityId):
     selected_buildings = []
     for building_id in selected_building_ids:
         building = buildings[building_id - 1]
-
         current_level = int(building["level"])
-        # if the building is being expanded, add 1 level
         if building["isBusy"]:
             current_level += 1
 
@@ -846,6 +766,7 @@ def getBuildingsToExpand(session, cityId):
         selected_buildings.append(building)
 
     return selected_buildings
+
 
 @cache
 def checkhash(url):
@@ -913,14 +834,6 @@ def do_it(session, city_id, city_name, buildings, shipments, expand_overall, wai
 
 @configurator
 def constructionList(session, event, stdin_fd, predetermined_input):
-    """
-    Parameters
-    ----------
-    session : ikabot.web.session.Session
-    event : multiprocessing.Event
-    stdin_fd: int
-    predetermined_input : multiprocessing.managers.SyncManager.list
-    """
     banner()
     wait_resources = False
     print("In which city do you want to expand buildings?")
@@ -930,7 +843,6 @@ def constructionList(session, event, stdin_fd, predetermined_input):
     if buildings is None or len(buildings) == 0:
         return None
 
-    #simulated resources
     simulated_resources = list(city["availableResources"])
     simulated_reducers = getCostsReducers(city)
 
@@ -947,12 +859,10 @@ def constructionList(session, event, stdin_fd, predetermined_input):
             elif b["building"] == "fireworker":
                 simulated_reducers[4] = min(50, simulated_reducers[4] + 1)
 
-    # NewList - Only Accepted
     confirmed_buildings = []
     shipments = []
     expand_overall = True
 
-    # Sequentially upgrade each building
     for building in buildings:
         current_level = building["level"]
         if building["isBusy"]:
@@ -961,7 +871,6 @@ def constructionList(session, event, stdin_fd, predetermined_input):
 
         current_reducers = list(simulated_reducers)
 
-        # calculate the resources that are needed
         resourcesNeeded = getResourcesNeeded(
             session, city, building, current_level, final_level, current_reducers
         )
@@ -976,20 +885,23 @@ def constructionList(session, event, stdin_fd, predetermined_input):
         waiting_seconds = max(0, city.get("endUpgradeTime", 0) - time.time())
         waiting_seconds += sum(b.get("constructionTime", 0) for b in confirmed_buildings)
         waiting_seconds += WINE_TRANSPORT_BUFFER_HOURS * 3600
+        
+        # Doar vinul primeste rezerva
         required = _constructionRequirements(session, city, resourcesNeeded, waiting_seconds)
         over_capacity = getResourcesOverCapacity(city, required)
         if over_capacity:
-            print("[WARNING] Insufficient storage for the planned resources, including wine reserve and consumption margin:")
+            print("[WARNING] Insufficient storage for the planned resources, including wine reserve:")
             for name, needed, capacity in over_capacity:
                 print(f"  - {name}: needed {needed:,}, capacity {capacity:,}. Upgrade storage or shorten the construction list.")
+        
         if resourcesNeeded[WINE_INDEX] > 0:
             print(f"Wine protected (reserve plus waiting margin): {required[WINE_INDEX] - resourcesNeeded[WINE_INDEX]:,}")
+            
         missing = [0] * len(materials_names)
         for i in range(len(materials_names)):
             if simulated_resources[i] < required[i]:
                 missing[i] = required[i] - simulated_resources[i]
 
-        # show missing resources to the user
         if sum(missing) > 0:
             print("\nMaterials needed for {} (lv {:d} -> {:d}):".format(building["name"], current_level, final_level))
             for i, name in enumerate(materials_names):
@@ -1007,7 +919,6 @@ def constructionList(session, event, stdin_fd, predetermined_input):
                 print("{} of {}".format(addThousandSeparator(missing[i]), name))
             print("")
 
-            # if the user wants, send the resources from the selected cities
             print("Automatically transport resources? [Y/n]")
             rta = read(values=["y", "Y", "n", "N", ""])
             if rta.lower() == "n":
@@ -1015,7 +926,7 @@ def constructionList(session, event, stdin_fd, predetermined_input):
                 rta = read(values=["y", "Y", "n", "N", ""])
                 if rta.lower() == "n":
                     print(f"\nSkipping {building['name']} due to user cancellation.\n")
-                    continue  # If it cancels, we skip it and it is NOT added to confirm_buildings
+                    continue
             else:
                 print("What type of ships do you want to use? (Default: Trade ships)")
                 print("(1) Trade ships")
@@ -1058,9 +969,8 @@ def constructionList(session, event, stdin_fd, predetermined_input):
             rta = read(values=["y", "Y", "n", "N", ""])
             if rta.lower() == "n":
                 print(f"\nSkipping {building['name']} due to user cancellation.\n")
-                continue  # If it cancels, we skip it and it is NOT added to confirm_buildings
+                continue
 
-        # Save the approved building and deduct it from the simulator
         confirmed_buildings.append(building)
         simulated_reducers = current_reducers
 
@@ -1070,7 +980,6 @@ def constructionList(session, event, stdin_fd, predetermined_input):
             else:
                 simulated_resources[i] -= resourcesNeeded[i]
 
-    # Replace list
     buildings = confirmed_buildings
 
     total_time = sum(building["constructionTime"] for building in buildings)
